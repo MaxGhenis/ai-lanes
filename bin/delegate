@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Preserve the caller's cwd: it is delegate's default workdir (-C).
+set -uo pipefail
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(dirname -- "$SCRIPT_DIR")
+PY="$ROOT/.venv/bin/python"
+[ -x "$PY" ] || PY=$(command -v python3)
+
+exec env PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m ai_lanes.delegate "$@"

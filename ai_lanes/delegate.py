@@ -6,12 +6,15 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
+
+from . import config
 
 JUDGMENT_PATTERNS = (
     r"review", r"adjudicat", r"referee", r"judge", r"assess", r"critique",
@@ -31,8 +34,6 @@ MODEL_NAMES = {
 PREAMBLE_WRITE = ("Standing orders: commit after every coherent step; create and maintain a committed "
                   "PROGRESS.md (state/done/next) from the start; write your final report to the output file.")
 PREAMBLE_AUDIT = "Frame this as a defensive correctness and completeness audit."
-REENROLL_RITUAL = ("Re-enroll lane {email}: run `claude setup-token` while signed into {email}, then store "
-                   "it in the keychain item `claude-quota-{email}` (or run `ai-lanes enroll {email}`).")
 
 
 def _now() -> datetime:
@@ -40,11 +41,33 @@ def _now() -> datetime:
 
 
 def _state_dir() -> Path:
-    return Path(os.environ.get("DELEGATE_STATE_DIR", "~/.local/state/delegate")).expanduser()
+    return config.state_dir()
 
 
 def _accounts_file() -> Path:
-    return Path(os.environ.get("DELEGATE_ACCOUNTS_FILE", "~/.config/ai-lanes/accounts.json")).expanduser()
+    return config.accounts_path()
+
+
+def _discover_tool(name: str, env_var: str) -> str:
+    """Resolve an override, this checkout's bin/, then PATH."""
+    override = os.environ.get(env_var)
+    if override:
+        return override
+    local = Path(__file__).resolve().parent.parent / "bin" / name
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    found = shutil.which(name)
+    if found:
+        return found
+    raise FileNotFoundError(f"{name} not found in repository bin or PATH")
+
+
+def _reenroll_ritual(email: str) -> str:
+    secret_name = config.secret_name_for(email, require_enrolled=False)
+    return (
+        f"Re-enroll lane {email}: run `claude setup-token` while signed into {email}, "
+        f"then run `ai-lanes enroll {email}` (secret item `{secret_name}`)."
+    )
 
 
 def _matches(prompt: str, patterns: Sequence[str]) -> list[str]:
@@ -99,16 +122,13 @@ def _set_last_used(email: str) -> None:
 
 
 def _enrolled() -> list[str]:
-    try:
-        enrolled = json.loads(_accounts_file().read_text()).get("enrolled", {})
-        return list(enrolled) if isinstance(enrolled, dict) else []
-    except (OSError, json.JSONDecodeError):
-        return []
+    enrolled = config.load().get("enrolled", {})
+    return list(enrolled) if isinstance(enrolled, dict) else []
 
 
 def _active_desktop_email() -> str | None:
-    binary = os.environ.get("DELEGATE_AI_LANES", "ai-lanes")
     try:
+        binary = _discover_tool("ai-lanes", "DELEGATE_AI_LANES")
         cp = subprocess.run([binary, "status", "--cached", "--json"], capture_output=True, text=True)
         if cp.returncode:
             return None
@@ -206,7 +226,11 @@ def _status() -> int:
             until = now
         print(f"  {email}: " + (f"cooldown until {until.isoformat()}" if until > now else "available"))
     try:
-        cp = subprocess.run([os.environ.get("DELEGATE_CODEX_PICK", str(Path("~/bin/codex-pick").expanduser())), "--json", "--all"], text=True, capture_output=True)
+        cp = subprocess.run(
+            [_discover_tool("codex-pick", "DELEGATE_CODEX_PICK"), "--json", "--all"],
+            text=True,
+            capture_output=True,
+        )
         sys.stdout.write(cp.stdout)
         sys.stderr.write(cp.stderr)
     except OSError as exc:
@@ -227,7 +251,11 @@ def _prompt_text(args: argparse.Namespace, parser: argparse.ArgumentParser) -> s
 
 def _codex_home() -> tuple[str | None, str]:
     try:
-        cp = subprocess.run([os.environ.get("DELEGATE_CODEX_PICK", str(Path("~/bin/codex-pick").expanduser()))], capture_output=True, text=True)
+        cp = subprocess.run(
+            [_discover_tool("codex-pick", "DELEGATE_CODEX_PICK")],
+            capture_output=True,
+            text=True,
+        )
     except OSError as exc:
         return None, str(exc) + "\n"
     return (cp.stdout.strip() if cp.returncode == 0 and cp.stdout.strip() else None), cp.stderr
@@ -289,11 +317,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = 3
                 cmd: list[str] = []
             else:
-                cmd = [os.environ.get("DELEGATE_CODEX_RUN", str(Path("~/dotfiles/bin/codex-run").expanduser())), "-H", lane_or_home,
-                       "-m", MODEL_NAMES[model], "-C", args.C, "-p", merged, "-o", output, "-s", sandbox]
-                if model == "sol": cmd += ["-e", "ultra"]
-                if args.b: cmd += ["-b", args.b]
-                result = 0 if args.dry_run else subprocess.run(cmd).returncode
+                try:
+                    runner = _discover_tool("codex-run", "DELEGATE_CODEX_RUN")
+                except FileNotFoundError as exc:
+                    print(f"delegate: {exc}", file=sys.stderr)
+                    cmd = []
+                    result = 3
+                else:
+                    cmd = [runner, "-H", lane_or_home, "-m", MODEL_NAMES[model],
+                           "-C", args.C, "-p", merged, "-o", output, "-s", sandbox]
+                    if model == "sol": cmd += ["-e", "ultra"]
+                    if args.b: cmd += ["-b", args.b]
+                    result = 0 if args.dry_run else subprocess.run(cmd).returncode
         else:
             lane_or_home = args.a or pick_fable_lane(tried)
             if not lane_or_home or attempts >= 3:
@@ -301,31 +336,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result = 3
             else:
                 tried.add(lane_or_home); attempts += 1
-                cmd = [os.environ.get("DELEGATE_CLAUDE_LANE", str(Path("~/dotfiles/bin/claude-lane").expanduser())), "-a", lane_or_home,
-                       "-m", MODEL_NAMES[model], "-C", args.C, "-p", merged, "-o", output, "-s", sandbox]
-                if args.d: cmd.append("-d")
-                if args.b: cmd += ["-b", args.b]
-                cp = None if args.dry_run else subprocess.run(cmd, capture_output=True, text=True)
-                if cp is None:
-                    result = 0
+                try:
+                    runner = _discover_tool("claude-lane", "DELEGATE_CLAUDE_LANE")
+                except FileNotFoundError as exc:
+                    print(f"delegate: {exc}", file=sys.stderr)
+                    cmd = []
+                    result = 3
                 else:
-                    sys.stdout.write(cp.stdout); sys.stderr.write(cp.stderr)
-                    result = cp.returncode
-                    if result == 4:
-                        record_cooldown(lane_or_home, _limited_until(cp.stderr + cp.stdout))
-                    elif result == 5:
-                        record_cooldown(lane_or_home, _now() + timedelta(days=30))
-                        print(REENROLL_RITUAL.format(email=lane_or_home), file=sys.stderr)
-                    if result in (4, 5) and not args.a and attempts < 3:
-                        attempt_record = {"ts": _now().isoformat(), "class": task_class, "model": model,
-                                          "lane/home": lane_or_home, "signals matched": signals,
-                                          "overrides": overrides, "cmd": cmd}
-                        _append_decision(attempt_record)
-                        if args.why:
-                            print("delegate decision: " + json.dumps(attempt_record, sort_keys=True), file=sys.stderr)
-                        continue
-                    if result in (4, 5):
-                        result = 3
+                    cmd = [runner, "-a", lane_or_home, "-m", MODEL_NAMES[model],
+                           "-C", args.C, "-p", merged, "-o", output, "-s", sandbox]
+                    if args.d: cmd.append("-d")
+                    if args.b: cmd += ["-b", args.b]
+                    cp = None if args.dry_run else subprocess.run(cmd, capture_output=True, text=True)
+                    if cp is None:
+                        result = 0
+                    else:
+                        sys.stdout.write(cp.stdout); sys.stderr.write(cp.stderr)
+                        result = cp.returncode
+                        if result == 4:
+                            record_cooldown(lane_or_home, _limited_until(cp.stderr + cp.stdout))
+                        elif result == 5:
+                            record_cooldown(lane_or_home, _now() + timedelta(days=30))
+                            print(_reenroll_ritual(lane_or_home), file=sys.stderr)
+                        if result in (4, 5) and not args.a and attempts < 3:
+                            attempt_record = {"ts": _now().isoformat(), "class": task_class, "model": model,
+                                              "lane/home": lane_or_home, "signals matched": signals,
+                                              "overrides": overrides, "cmd": cmd}
+                            _append_decision(attempt_record)
+                            if args.why:
+                                print("delegate decision: " + json.dumps(attempt_record, sort_keys=True), file=sys.stderr)
+                            continue
+                        if result in (4, 5):
+                            result = 3
 
         record = {"ts": _now().isoformat(), "class": task_class, "model": model,
                   "lane/home": lane_or_home, "signals matched": signals, "overrides": overrides, "cmd": cmd}

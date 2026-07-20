@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# ai-lanes CLI shim. Prefer the repository's managed environment, then python3.
+set -uo pipefail
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT=$(dirname -- "$SCRIPT_DIR")
+PY="$ROOT/.venv/bin/python"
+[ -x "$PY" ] || PY=$(command -v python3)
+
+cd "$ROOT" && exec "$PY" -m ai_lanes.cli "$@"

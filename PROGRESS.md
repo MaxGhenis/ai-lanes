@@ -13,8 +13,9 @@ The source package has been copied and renamed under `ai_lanes`; source trees re
 - Copied the package modules, renamed the package/CLI/environment namespace, and scrubbed private prose and path defaults.
 - Added the shared accounts/config, XDG state, secret-store, and notification layers.
 - Removed statusline and report-generation integrations while retaining the generic watch cycle.
+- Added repo-relative CLI shims, generalized dispatcher discovery, and both hardened runners.
 
 ## Next
 
-- Generalize dispatcher discovery and add the repo-relative shell shims and hardened runners.
-- Adapt and extend the full source test suite, then run dry-run and scrub gates.
+- Commit the adapted and extended full source test suite.
+- Run clean/live dry-run proofs, packaging checks, and the hard scrub gate.
