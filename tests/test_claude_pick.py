@@ -1,0 +1,293 @@
+"""Lane ranking (claude-pick): pure ranking, fleet summary, CLI, watchdog and
+render wiring. All probes are mocked — no network, no keychain."""
+
+import json
+from datetime import timedelta
+
+import pytest
+
+from ai_lanes import claude, cli, watchdog
+from ai_lanes.claude import lane_verdict, lanes_fleet, rank_lanes
+from ai_lanes.util import iso, now_local
+
+
+def lane_row(email, fh=None, wk=None, enrolled=True, active=False, status="ok",
+             fh_reset=None, wk_reset=None):
+    """An accounts_report row with a mocked oauth/usage probe."""
+    row = {"email": email, "active": active, "enrolled": enrolled}
+    if not enrolled:
+        return row
+    probe = {"status": status, "checked_at": "2026-07-18T12:00:00-04:00"}
+    if status == "ok":
+        windows = {}
+        if fh is not None:
+            probe["five_hour"] = {"used_percent": fh, "reset_at": fh_reset}
+            windows["five_hour"] = probe["five_hour"]
+        if wk is not None:
+            probe["seven_day"] = {"used_percent": wk, "reset_at": wk_reset}
+            windows["seven_day"] = probe["seven_day"]
+        probe["windows"] = windows
+    row["probe"] = probe
+    return row
+
+
+class TestRankLanes:
+    def test_lowest_usage_wins(self):
+        ranked = rank_lanes([
+            lane_row("alpha@example.com", fh=60, wk=20),
+            lane_row("beta@example.com", fh=5, wk=10),
+        ])
+        assert ranked[0]["email"] == "beta@example.com"
+
+    def test_active_handicap_spares_anchor(self):
+        ranked = rank_lanes([
+            lane_row("anchor@example.com", fh=10, wk=10, active=True),
+            lane_row("beta@example.com", fh=15, wk=15),
+        ])
+        # 10+10 handicap > 15, so the alternate wins despite higher raw usage.
+        assert ranked[0]["email"] == "beta@example.com"
+
+    def test_no_handicap_ranks_raw(self):
+        ranked = rank_lanes([
+            lane_row("anchor@example.com", fh=10, wk=10, active=True),
+            lane_row("beta@example.com", fh=15, wk=15),
+        ], handicap=0)
+        assert ranked[0]["email"] == "anchor@example.com"
+
+    def test_weekly_window_is_a_hard_gate(self):
+        # Fresh 5h window does not rescue a lane through its week.
+        ranked = rank_lanes([
+            lane_row("alpha@example.com", fh=2, wk=97),
+            lane_row("beta@example.com", fh=50, wk=50),
+        ])
+        assert [r["email"] for r in ranked] == ["beta@example.com"]
+
+    def test_worst_window_drives_score(self):
+        ranked = rank_lanes([
+            lane_row("alpha@example.com", fh=10, wk=60),
+            lane_row("beta@example.com", fh=30, wk=20),
+        ])
+        # effective a=60, b=30.
+        assert ranked[0]["email"] == "beta@example.com"
+
+    def test_weekly_tiebreak(self):
+        ranked = rank_lanes([
+            lane_row("alpha@example.com", fh=30, wk=10),
+            lane_row("beta@example.com", fh=30, wk=30),
+        ])
+        # equal effective usage (30) -> lower weekly wins.
+        assert ranked[0]["email"] == "alpha@example.com"
+
+    def test_email_tiebreak_is_deterministic(self):
+        ranked = rank_lanes([
+            lane_row("beta@example.com", fh=10, wk=10),
+            lane_row("alpha@example.com", fh=10, wk=10),
+        ])
+        assert [r["email"] for r in ranked] == ["alpha@example.com", "beta@example.com"]
+
+    def test_dead_and_unenrolled_excluded(self):
+        ranked = rank_lanes([
+            lane_row("alpha@example.com", enrolled=False),
+            lane_row("beta@example.com", status="token-invalid"),
+            lane_row("charlie@example.com", status="secret-missing"),
+            lane_row("delta@example.com", status="rate-limited"),
+            lane_row("echo@example.com", fh=98, wk=10),  # under 5% headroom
+            lane_row("foxtrot@example.com", status="ok"),   # probe ok, no window fields
+        ])
+        assert ranked == []
+
+    def test_single_window_lane_still_ranks(self):
+        # Server omitted seven_day: rank on what was reported, never fabricate.
+        ranked = rank_lanes([lane_row("alpha@example.com", fh=20)])
+        assert ranked[0]["email"] == "alpha@example.com"
+        assert ranked[0]["weekly_used_percent"] is None
+
+
+class TestVerdicts:
+    def test_verdict_labels(self):
+        assert lane_verdict(lane_row("alpha@example.com", enrolled=False)) == "not-enrolled"
+        assert lane_verdict(lane_row("alpha@example.com", status="token-invalid")) == "token-invalid"
+        assert lane_verdict(lane_row("alpha@example.com", status="secret-missing")) == "secret-missing"
+        assert lane_verdict(lane_row("alpha@example.com", status="ok")) == "no-window-data"
+        assert lane_verdict(lane_row("alpha@example.com", fh=99, wk=10)) == "exhausted"
+        assert lane_verdict(lane_row("alpha@example.com", fh=10, wk=99)) == "exhausted"
+        assert lane_verdict(lane_row("alpha@example.com", fh=10, wk=10)) == "ok"
+
+
+class TestLanesFleet:
+    def test_summary_counts_and_best(self):
+        fleet = lanes_fleet([
+            lane_row("alpha@example.com", fh=10, wk=10),
+            lane_row("beta@example.com", fh=99, wk=10),
+            lane_row("charlie@example.com", enrolled=False),
+        ])
+        assert fleet["enrolled"] == 2
+        assert fleet["dispatchable_now"] == 1
+        assert fleet["best"] == "alpha@example.com"
+        assert [l["verdict"] for l in fleet["lanes"]] == ["ok", "exhausted"]
+
+    def test_earliest_reset_uses_governing_window(self):
+        soon = iso(now_local() + timedelta(hours=1))
+        later = iso(now_local() + timedelta(hours=3))
+        much_later = iso(now_local() + timedelta(days=2))
+        fleet = lanes_fleet([
+            # 5h exhausted only: governed by the 5h reset (soon).
+            lane_row("alpha@example.com", fh=99, wk=50, fh_reset=soon, wk_reset=much_later),
+            # both windows exhausted: usable only when BOTH reset (the later one).
+            lane_row("beta@example.com", fh=99, wk=99, fh_reset=later, wk_reset=much_later),
+        ])
+        assert fleet["dispatchable_now"] == 0
+        assert fleet["earliest_reset"] == soon
+        by = {l["email"]: l for l in fleet["lanes"]}
+        assert by["alpha@example.com"]["reset_at"] == soon
+        assert by["beta@example.com"]["reset_at"] == much_later
+
+    def test_empty_roster(self):
+        fleet = lanes_fleet([])
+        assert fleet == {"enrolled": 0, "dispatchable_now": 0, "best": None,
+                         "earliest_reset": None, "lanes": []}
+
+
+class TestClaudePickCli:
+    def _patch_rows(self, monkeypatch, rows, active="anchor@example.com"):
+        monkeypatch.setattr(claude, "identity", lambda: {"email": active})
+        monkeypatch.setattr(claude, "accounts_report",
+                            lambda active_email, timeout=15.0: rows)
+
+    def test_best_email_on_stdout(self, env_paths, monkeypatch, capsys):
+        self._patch_rows(monkeypatch, [
+            lane_row("alpha@example.com", fh=40, wk=30),
+            lane_row("beta@example.com", fh=10, wk=10),
+        ])
+        rc = cli.main(["claude-pick"])
+        out = capsys.readouterr()
+        assert rc == 0
+        assert out.out.strip() == "beta@example.com"
+        assert "5h 10%" in out.err
+
+    def test_no_lane_exits_1_with_earliest_reset(self, env_paths, monkeypatch, capsys):
+        soon = iso(now_local() + timedelta(hours=2))
+        self._patch_rows(monkeypatch, [lane_row("alpha@example.com", fh=99, wk=10, fh_reset=soon)])
+        rc = cli.main(["claude-pick"])
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "no dispatchable claude lane" in err
+        assert soon in err
+
+    def test_zero_enrolled_prints_ritual(self, env_paths, monkeypatch, capsys):
+        self._patch_rows(monkeypatch, [lane_row("alpha@example.com", enrolled=False)])
+        rc = cli.main(["claude-pick"])
+        err = capsys.readouterr().err
+        assert rc == 1
+        assert "claude setup-token" in err
+        assert "ai-lanes enroll" in err
+
+    def test_json_ranking_and_exclusions(self, env_paths, monkeypatch, capsys):
+        self._patch_rows(monkeypatch, [
+            lane_row("alpha@example.com", fh=10, wk=10),
+            lane_row("beta@example.com", fh=20, wk=20),
+            lane_row("charlie@example.com", status="token-invalid"),
+        ])
+        rc = cli.main(["claude-pick", "--json", "--all"])
+        out = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert out["best"] == "alpha@example.com"
+        assert [r["email"] for r in out["ranked"]] == ["alpha@example.com", "beta@example.com"]
+        assert out["excluded"] == [{"email": "charlie@example.com", "verdict": "token-invalid", "reset_at": None}]
+        assert out["enrolled"] == 3
+
+    def test_handicap_flag_wiring(self, env_paths, monkeypatch, capsys):
+        self._patch_rows(monkeypatch, [
+            lane_row("anchor@example.com", fh=10, wk=10, active=True),
+            lane_row("beta@example.com", fh=15, wk=15),
+        ])
+        assert cli.main(["claude-pick"]) == 0
+        assert capsys.readouterr().out.strip() == "beta@example.com"
+        assert cli.main(["claude-pick", "--no-handicap"]) == 0
+        assert capsys.readouterr().out.strip() == "anchor@example.com"
+
+    def test_cached_uses_snapshot(self, env_paths, monkeypatch, capsys):
+        from ai_lanes import paths
+        from ai_lanes.util import atomic_write_json
+
+        atomic_write_json(paths.snapshot_path(), {
+            "generated_at": iso(now_local()),
+            "claude": {"accounts": [lane_row("cached@example.com", fh=5, wk=5)]},
+        })
+        # Live probes must not run in cached mode.
+        monkeypatch.setattr(claude, "accounts_report",
+                            lambda *a, **k: pytest.fail("live probe in --cached"))
+        rc = cli.main(["claude-pick", "--cached"])
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "cached@example.com"
+
+
+def lane_snap(lanes_fleet_dict):
+    """Minimal snapshot with healthy codex and a given claude lane fleet."""
+    from test_pick import entry
+
+    homes = [entry("/h/.codex-3", 5, account="b")]
+    return {
+        "generated_at": now_local().isoformat(timespec="seconds"),
+        "codex": {
+            "homes": homes,
+            "duplicates": [],
+            "fleet": {"total_homes": 1, "dispatchable_now": 1,
+                      "best_home": "/h/.codex-3", "earliest_reset": None},
+        },
+        "claude": {
+            "account": {"email": "anchor@example.com"},
+            "known_accounts": [],
+            "subscription": "max",
+            "tier": "default_claude_max_20x",
+            "keychain": {"status": "ok"},
+            "oauth_probe": {"status": "token-invalid"},
+            "recent_errors": [],
+            "active_limit": None,
+            "verdict": "ok",
+            "lanes": lanes_fleet_dict,
+        },
+    }
+
+
+class TestWatchdogLaneConditions:
+    def test_lane_auth_failure_alerts_with_ritual(self, env_paths):
+        s = lane_snap(lanes_fleet([
+            lane_row("alpha@example.com", fh=10, wk=10),
+            lane_row("broken@example.com", status="token-invalid"),
+        ]))
+        summary = watchdog.run(snap=s)
+        assert "claude-lane-auth:broken@example.com" in summary["alerts_sent"]
+        log = env_paths["notify_log"].read_text()
+        assert "ai-lanes enroll broken@example.com" in log
+
+    def test_all_lanes_exhausted_warns_only_when_enrolled(self, env_paths):
+        empty = lane_snap(lanes_fleet([]))
+        assert "claude-lanes-empty" not in watchdog.run(snap=empty)["alerts_sent"]
+        exhausted = lane_snap(lanes_fleet([lane_row("alpha@example.com", fh=99, wk=10)]))
+        summary = watchdog.run(snap=exhausted)
+        assert "claude-lanes-empty" in summary["alerts_sent"]
+
+    def test_lane_auth_recovery_notice(self, env_paths):
+        bad = lane_snap(lanes_fleet([lane_row("alpha@example.com", status="token-invalid")]))
+        watchdog.run(snap=bad)
+        good = lane_snap(lanes_fleet([lane_row("alpha@example.com", fh=10, wk=10)]))
+        summary = watchdog.run(snap=good)
+        assert "claude-lane-auth:alpha@example.com" in summary["recovered"]
+
+
+class TestLaneRender:
+    def test_table_shows_lane_rows_and_fleet_line(self, env_paths):
+        from ai_lanes import render
+
+        s = lane_snap(lanes_fleet([
+            lane_row("alpha@example.com", fh=12, wk=34),
+            lane_row("broken@example.com", status="token-invalid"),
+        ]))
+        s["claude"]["accounts"] = [lane_row("unenrolled@example.com", enrolled=False)]
+        out = render.table(s)
+        assert "lanes: 1/2 dispatchable" in out
+        assert "best: alpha@example.com" in out
+        assert "TOKEN-INVALID" in out
+        assert "12%" in out and "34%" in out
+        assert "not enrolled (1)" in out

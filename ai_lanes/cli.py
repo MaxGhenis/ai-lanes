@@ -241,11 +241,13 @@ def cmd_enroll(args) -> int:
 
 def cmd_secret(args) -> int:
     """Internal bridge used by the hardened shell runner."""
-    try:
-        name = config.secret_name_for(args.email, require_enrolled=True)
-    except config.ConfigError as exc:
-        print(f"ai-lanes secret: {exc}", file=sys.stderr)
-        return 2
+    name = config.secret_name_for(args.email, require_enrolled=True)
+    if name is None:
+        print(
+            f"ai-lanes secret: {args.email} is not enrolled in {config.accounts_path()}",
+            file=sys.stderr,
+        )
+        return 1
     value = secret_store.get(name)
     if value is None:
         print(f"ai-lanes secret: item unavailable for {args.email}", file=sys.stderr)

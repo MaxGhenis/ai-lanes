@@ -100,13 +100,13 @@ def secret_name_prefix() -> str:
     return value if isinstance(value, str) else DEFAULT_SECRET_NAME_PREFIX
 
 
-def secret_name_for(email: str, *, require_enrolled: bool = False) -> str:
+def secret_name_for(email: str, *, require_enrolled: bool = False) -> str | None:
     enrolled = load().get("enrolled") or {}
     name = enrolled.get(email) if isinstance(enrolled, dict) else None
     if isinstance(name, str) and name:
         return name
     if require_enrolled:
-        raise ConfigError(f"{email} is not enrolled in {accounts_path()}")
+        return None
     return f"{secret_name_prefix()}{email}"
 
 
