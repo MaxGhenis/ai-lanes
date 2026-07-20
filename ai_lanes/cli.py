@@ -8,8 +8,7 @@
   ai-lanes claude-pick          # best enrolled Claude lane (email) on stdout
   ai-lanes claude-pick --json --all  # full lane ranking with exclusions
   ai-lanes errors --hours 48    # observed limit/auth errors, both providers
-  ai-lanes watch [--dry-run]    # watchdog cycle (launchd entrypoint)
-  ai-lanes brief                # morning-brief markdown section
+  ai-lanes watch [--dry-run]    # one monitor/alert cycle (scheduler-friendly)
   ai-lanes enroll <email>       # store a Claude lane token (from claude setup-token)
 
 Orchestrator one-liners:
@@ -21,7 +20,7 @@ import argparse
 import json
 import sys
 
-from . import claude, codex, paths, render, snapshot, watchdog
+from . import claude, codex, config, paths, render, secret_store, snapshot, watchdog
 from .util import load_json, strip_private
 
 
@@ -195,21 +194,23 @@ def cmd_watch(args) -> int:
     return 0
 
 
-def cmd_brief(args) -> int:
-    snap = _load_snapshot(cached=True)
-    print(render.brief_md(snap))
-    return 0
-
-
 def cmd_enroll(args) -> int:
     """Store a per-account Claude OAuth token (from `claude setup-token`) so the
     watchdog can probe that account's limits. Token is read from stdin — never
     from argv — validated against the usage endpoint before storing."""
     import getpass
-    import subprocess as sp
-
     email = args.email
-    roster = claude.known_accounts()
+    try:
+        cfg = config.load(strict=True)
+    except config.ConfigError as exc:
+        print(f"ai-lanes enroll: {exc}", file=sys.stderr)
+        return 2
+    accounts = cfg.get("accounts", [])
+    enrolled = cfg.get("enrolled")
+    if not isinstance(accounts, list) or (enrolled is not None and not isinstance(enrolled, dict)):
+        print(f"ai-lanes enroll: invalid roster schema in {config.accounts_path()}", file=sys.stderr)
+        return 2
+    roster = sorted(account for account in accounts if isinstance(account, str) and "@" in account)
     if email not in roster:
         print(f"ai-lanes enroll: {email} is not in the roster ({len(roster)} accounts); "
               f"add it to {claude.roster_config_path()} first", file=sys.stderr)
@@ -226,19 +227,30 @@ def cmd_enroll(args) -> int:
         print(f"ai-lanes enroll: token REJECTED by usage endpoint ({probe.get('status')}) — "
               "not storing. Is it fresh, and for the right account?", file=sys.stderr)
         return 1
-    secret = f"claude-quota-{email}"
-    r = sp.run([str(paths.HOME / ".claude" / "manage-secret.sh"), "set", secret, token],
-               capture_output=True, text=True, timeout=30)
-    if r.returncode != 0:
-        print(f"ai-lanes enroll: secret store failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+    secret = config.secret_name_for(email)
+    if not secret_store.set(secret, token):
+        print("ai-lanes enroll: secret store failed", file=sys.stderr)
         return 1
-    cfg_path = claude.roster_config_path()
-    cfg = load_json(cfg_path, {}) or {}
     cfg.setdefault("enrolled", {})[email] = secret
-    cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
+    config.save(cfg)
     extracted = {k: probe.get(k) for k in ("five_hour", "seven_day") if probe.get(k)}
-    print(f"enrolled {email} -> keychain {secret}; probe ok"
+    print(f"enrolled {email} -> secret store item {secret}; probe ok"
           + (f" {json.dumps(extracted)}" if extracted else " (no window fields recognized — raw kept in snapshots)"))
+    return 0
+
+
+def cmd_secret(args) -> int:
+    """Internal bridge used by the hardened shell runner."""
+    try:
+        name = config.secret_name_for(args.email, require_enrolled=True)
+    except config.ConfigError as exc:
+        print(f"ai-lanes secret: {exc}", file=sys.stderr)
+        return 2
+    value = secret_store.get(name)
+    if value is None:
+        print(f"ai-lanes secret: item unavailable for {args.email}", file=sys.stderr)
+        return 1
+    print(value)
     return 0
 
 
@@ -277,16 +289,18 @@ def main(argv=None) -> int:
     p_errors.add_argument("--hours", type=float, default=24)
     p_errors.add_argument("--json", action="store_true")
 
-    p_watch = sub.add_parser("watch", help="watchdog cycle: snapshot + alerts (launchd)")
+    p_watch = sub.add_parser("watch", help="one snapshot + alert cycle (for cron or another scheduler)")
     p_watch.add_argument("--dry-run", action="store_true", help="print alerts instead of sending")
 
-    sub.add_parser("brief", help="morning-brief markdown section")
-
     p_enroll = sub.add_parser("enroll", help="store a Claude account token for quota probing")
-    p_enroll.add_argument("email", help="account email (must be in claude-accounts.json roster)")
+    p_enroll.add_argument("email", help="account email (must be in accounts.json roster)")
+
+    p_secret = sub.add_parser("secret", help=argparse.SUPPRESS)
+    p_secret.add_argument("action", choices=("get-for-account",))
+    p_secret.add_argument("email")
 
     argv = list(sys.argv[1:] if argv is None else argv)
-    known = {"status", "pick", "claude-pick", "errors", "watch", "brief", "enroll"}
+    known = {"status", "pick", "claude-pick", "errors", "watch", "enroll", "secret"}
     if not argv or (argv[0] not in known and argv[0] not in ("-h", "--help")):
         argv = ["status", *argv]
     args = parser.parse_args(argv)
@@ -296,8 +310,8 @@ def main(argv=None) -> int:
         "claude-pick": cmd_claude_pick,
         "errors": cmd_errors,
         "watch": cmd_watch,
-        "brief": cmd_brief,
         "enroll": cmd_enroll,
+        "secret": cmd_secret,
     }
     return handlers[args.command](args)
 

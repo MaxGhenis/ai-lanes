@@ -1,24 +1,13 @@
-"""Claude side: active-account identity, keychain OAuth probe, transcript error
-scan, and the statusline tap state file.
-
-Live-quota reality check (2026-07-11): Claude Code pipes rate_limits
-(five_hour / seven_day used_percentage) into statusline commands but caches
-nothing usable on disk, and the keychain OAuth token can be server-invalid even
-while interactive sessions work (the app/harness holds its own live auth). So:
-- statusline tap state = freshest live percentages (whenever any session runs),
-- transcript isApiErrorMessage events = observed hard limits with reset times,
-- keychain probe = best-effort, clearly labeled when invalid.
-"""
+"""Claude identity, per-account OAuth quota probes, and limit-event scans."""
 
 import json
-import os
 import subprocess
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import paths
+from . import config, paths, secret_store
 from .util import from_epoch, iso, load_json, now_local, parse_iso, parse_reset_clock
 
 OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -46,43 +35,25 @@ def identity() -> dict:
 
 
 def roster_config_path() -> Path:
-    cfg_path = os.environ.get("AI_LANES_CLAUDE_ACCOUNTS")
-    return Path(cfg_path).expanduser() if cfg_path else Path(__file__).parent.parent / "claude-accounts.json"
+    return config.accounts_path()
 
 
 def roster_config() -> dict:
-    return load_json(roster_config_path(), {}) or {}
+    return config.load()
 
 
 def known_accounts() -> list[str]:
-    """Full Claude account roster from config plus locally observed accounts.
-
-    Identity only — accounts without a local token are not probeable.
-    """
-    emails: set[str] = set()
+    """Full configured roster; accounts without a token remain identity-only."""
     cfg = roster_config()
-    emails.update(a for a in cfg.get("accounts", []) if isinstance(a, str) and "@" in a)
-    d = load_json(paths.claude_dir() / "cc-mirror-accounts.json", {}) or {}
-    emails.update(v.split(" (")[0] for v in d.values() if isinstance(v, str) and "@" in v)
-    return sorted(emails)
+    return sorted({a for a in cfg.get("accounts", []) if isinstance(a, str) and "@" in a})
 
 
-def agent_secret_get(name: str, runner=subprocess.run) -> str | None:
-    try:
-        out = runner(
-            [str(Path.home() / "bin" / "agent-secret"), "get", name],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    tok = out.stdout.strip()
-    return tok if out.returncode == 0 and tok else None
+def agent_secret_get(name: str, runner=None) -> str | None:
+    return secret_store.get(name, runner=runner)
 
 
 def accounts_report(active_email: str | None, timeout: float = 15.0,
-                    opener=None, secret_runner=subprocess.run) -> list[dict]:
+                    opener=None, secret_runner=None) -> list[dict]:
     """Per-account Claude quota, roster order (active first). Enrolled accounts
     are probed with their stored setup-token; everything else is identity-only.
     Never fabricates: an unprobeable account carries enrolled=False and no
@@ -308,32 +279,6 @@ def probe_oauth_usage(token: str | None, timeout: float = 15.0, opener=None) -> 
         if key in windows:
             result[key] = windows[key]
     return result
-
-
-def statusline_state(max_age_min: float = 30) -> dict | None:
-    """Latest rate_limits captured by the statusline tap, with freshness label."""
-    d = load_json(paths.statusline_state_path())
-    if not d:
-        return None
-    updated = parse_iso(d.get("updated_at"))
-    age_min = None
-    if updated:
-        age_min = round((now_local() - updated).total_seconds() / 60, 1)
-    rl = d.get("rate_limits") or {}
-
-    def pct(key):
-        w = rl.get(key) or {}
-        v = w.get("used_percentage")
-        return round(v, 1) if isinstance(v, (int, float)) else None
-
-    return {
-        "updated_at": d.get("updated_at"),
-        "age_min": age_min,
-        "fresh": age_min is not None and age_min <= max_age_min,
-        "five_hour_pct": pct("five_hour"),
-        "seven_day_pct": pct("seven_day"),
-        "raw": rl,
-    }
 
 
 def _candidate_transcripts(hours: float) -> list[Path]:

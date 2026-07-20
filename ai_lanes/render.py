@@ -1,4 +1,4 @@
-"""Human rendering: terminal table, morning-brief markdown section."""
+"""Human rendering for the terminal monitor."""
 
 from .util import fmt_clock, now_local, parse_iso
 
@@ -73,7 +73,6 @@ def table(snap: dict) -> str:
     lines.append(f"CLAUDE (active login: {acct}, tier {tier})")
     active_row = next((a for a in c.get("accounts") or [] if a.get("active")), {})
     live = active_row.get("live")
-    sl = c.get("statusline")
     if live and live.get("five_hour_pct") is not None:
         wk = f" · week {live['seven_day_pct']}%" if live.get("seven_day_pct") is not None else ""
         models = " ".join(
@@ -84,10 +83,6 @@ def table(snap: dict) -> str:
             f" ({live['source']} {fmt_clock(parse_iso(live.get('as_of')), now)}){wk}"
             + (f" {models}" if models else "")
         )
-    elif sl and sl.get("five_hour_pct") is not None:
-        fresh = "live" if sl.get("fresh") else f"as of {fmt_clock(parse_iso(sl['updated_at']), now)}"
-        wk = f" · week {sl['seven_day_pct']}%" if sl.get("seven_day_pct") is not None else ""
-        lines.append(f"  5h window: {sl['five_hour_pct']}% used ({fresh}){wk}")
     else:
         probe_status = (c.get("oauth_probe") or {}).get("status", "?")
         hint = {
@@ -167,52 +162,4 @@ def table(snap: dict) -> str:
             + ", ".join(a["email"].split("@")[1] for a in unenrolled)
             + "  — enroll: claude setup-token | ai-lanes enroll <email>"
         )
-    return "\n".join(lines)
-
-
-def brief_md(snap: dict) -> str:
-    """Compact Markdown capacity summary."""
-    now = parse_iso(snap.get("generated_at")) or now_local()
-    lines = ["## AI capacity"]
-    fleet = snap["codex"]["fleet"]
-    parts = [f"codex: {fleet['dispatchable_now']}/{fleet['total_homes']} lanes dispatchable"]
-    if fleet.get("best_home"):
-        parts.append(f"best {_short_home(fleet['best_home'])}")
-    if fleet.get("earliest_reset"):
-        parts.append(f"earliest reset {fmt_clock(parse_iso(fleet['earliest_reset']), now)}")
-    lines.append("- " + " · ".join(parts))
-    problems = []
-    for e in snap["codex"]["homes"]:
-        if e["verdict"] in ("auth-revoked", "auth-suspect", "no-auth"):
-            problems.append(f"{_short_home(e['home'])} {e['verdict']}")
-    if snap["codex"]["duplicates"]:
-        dups = ", ".join(
-            " + ".join(_short_home(h) for h in d["homes"]) for d in snap["codex"]["duplicates"]
-        )
-        problems.append(f"DUPLICATE account bindings: {dups} (revocation trap)")
-    if problems:
-        lines.append("- ⚠ codex auth: " + "; ".join(problems) + " — fix: `CODEX_HOME=<home> codex login`")
-    c = snap["claude"]
-    sl = c.get("statusline") or {}
-    if c.get("active_limit"):
-        a = c["active_limit"]
-        lines.append(
-            f"- claude: LIMITED ({a['kind']}) — resets {fmt_clock(parse_iso(a['reset_at']), now)}"
-        )
-    elif sl.get("five_hour_pct") is not None:
-        wk = f", week {sl['seven_day_pct']}%" if sl.get("seven_day_pct") is not None else ""
-        stamp = "" if sl.get("fresh") else f" (as of {fmt_clock(parse_iso(sl.get('updated_at')), now)})"
-        lines.append(f"- claude: 5h {sl['five_hour_pct']}%{wk}{stamp}")
-    else:
-        lines.append("- claude: usage unknown (no fresh statusline capture)")
-    fleet_c = c.get("lanes") or {}
-    if fleet_c.get("enrolled"):
-        lane_parts = [
-            f"claude lanes: {fleet_c.get('dispatchable_now', 0)}/{fleet_c['enrolled']} dispatchable"
-        ]
-        if fleet_c.get("best"):
-            lane_parts.append(f"best {fleet_c['best']}")
-        if fleet_c.get("earliest_reset"):
-            lane_parts.append(f"earliest reset {fmt_clock(parse_iso(fleet_c['earliest_reset']), now)}")
-        lines.append("- " + " · ".join(lane_parts))
     return "\n".join(lines)

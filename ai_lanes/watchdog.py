@@ -14,31 +14,14 @@ Alerting contract (incident 2026-07-11 postmortem):
 """
 
 import json
-import subprocess
-import sys
-
-from . import paths, render, snapshot
+from . import notify, paths, snapshot
 from .util import atomic_write_json, fmt_clock, load_json, now_local, parse_iso
 
 REALERT_HOURS = 6
 
 
 def _notify(subject: str, body: str, dry_run: bool) -> bool:
-    if dry_run:
-        print(f"[dry-run] ALERT: {subject}\n{body}\n", file=sys.stderr)
-        return True
-    notify = paths.notify_bin()
-    if not notify.exists():
-        print(f"ai-lanes: notify transport missing at {notify}; alert lost: {subject}", file=sys.stderr)
-        return False
-    try:
-        r = subprocess.run([str(notify), subject, body], capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            print(f"ai-lanes: notify failed rc={r.returncode}: {r.stderr[:200]}", file=sys.stderr)
-        return r.returncode == 0
-    except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"ai-lanes: notify error: {e}", file=sys.stderr)
-        return False
+    return notify.send(subject, body, dry_run=dry_run)
 
 
 def _short(home: str) -> str:
@@ -225,6 +208,10 @@ def run(dry_run: bool = False, live: bool = True, snap: dict | None = None) -> d
     atomic_write_json(paths.snapshot_path(), snap)
 
     # Compact history line for later trend analysis.
+    active_row = next(
+        (row for row in snap["claude"].get("accounts") or [] if row.get("active")),
+        {},
+    )
     hist = {
         "ts": snap["generated_at"],
         "codex": {
@@ -235,7 +222,7 @@ def run(dry_run: bool = False, live: bool = True, snap: dict | None = None) -> d
             }
             for e in snap["codex"]["homes"]
         },
-        "claude_5h": (snap["claude"].get("statusline") or {}).get("five_hour_pct"),
+        "claude_5h": (active_row.get("live") or {}).get("five_hour_pct"),
         "claude_lanes": {
             "enrolled": (snap["claude"].get("lanes") or {}).get("enrolled"),
             "dispatchable": (snap["claude"].get("lanes") or {}).get("dispatchable_now"),
@@ -243,8 +230,6 @@ def run(dry_run: bool = False, live: bool = True, snap: dict | None = None) -> d
     }
     with open(paths.history_path(), "a") as f:
         f.write(json.dumps(hist) + "\n")
-
-    paths.brief_path().write_text(render.brief_md(snap) + "\n")
 
     conditions = evaluate_conditions(snap)
     alerts_state = load_json(paths.alerts_path(), {}) or {}

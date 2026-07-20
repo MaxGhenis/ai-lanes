@@ -137,7 +137,6 @@ def build(live: bool = True, timeout: float = 15.0, transcript_hours: float = 24
         cprobe = {"status": "delegated-to-enrollment"}
     else:
         cprobe = (claude_probe_fn or claude.probe_oauth_usage)(creds.get("_token"), timeout=timeout)
-    sl = claude.statusline_state()
     events = claude.transcript_limit_events(hours=transcript_hours)
     active = claude.active_limit(events, now=now)
 
@@ -162,51 +161,36 @@ def build(live: bool = True, timeout: float = 15.0, transcript_hours: float = 24
     # discovery for the percentage extraction (local file, no tokens).
     if cprobe.get("status") == "ok" and cprobe.get("raw") is not None:
         try:
-            atomic_write_json(paths.state_dir() / "claude-oauth-raw.json",
+            atomic_write_json(paths.oauth_raw_path(),
                               {"checked_at": cprobe.get("checked_at"), "raw": cprobe["raw"]})
         except OSError:
             pass
 
-    active_live = None
+    active_live = _probe_live(cprobe, "oauth")
     active_probe_status = cprobe.get("status")
     for row in accounts:
         if not row["active"]:
             continue
-        # Live-source order for the active account: keychain-token probe,
-        # else the account's own enrolled-token probe, else the statusline tap.
-        row_live = _probe_live(cprobe, "oauth") or _probe_live(row.get("probe") or {}, "oauth-enrolled")
-        if row_live is None and sl and sl.get("five_hour_pct") is not None:
-            row_live = {
-                "five_hour_pct": sl["five_hour_pct"],
-                "seven_day_pct": sl.get("seven_day_pct"),
-                "source": "statusline",
-                "as_of": sl.get("updated_at"),
-            }
+        # The native login-token probe owns the active account unless that
+        # account has a dedicated enrolled token.
+        row_live = active_live or _probe_live(row.get("probe") or {}, "oauth-enrolled")
         if row_live:
             row["live"] = row_live
             active_live = row_live
         if (row.get("probe") or {}).get("status"):
             active_probe_status = row["probe"]["status"]
         row["oauth_status"] = active_probe_status
-        if sl and sl.get("five_hour_pct") is not None:
-            row["statusline"] = {
-                "five_hour_pct": sl["five_hour_pct"],
-                "seven_day_pct": sl.get("seven_day_pct"),
-                "fresh": sl.get("fresh"),
-                "updated_at": sl.get("updated_at"),
-            }
 
     # Live data supersedes transcript inference: an observed "session limit"
     # error with a future reset can be stale (a new window opened since).
     # Only keep it ACTIVE when live 5h usage corroborates.
     if active and active_live and (active_live.get("five_hour_pct") or 0) < 95 \
-            and active_live.get("five_hour_pct") is not None \
-            and active_live.get("source") != "statusline":
+            and active_live.get("five_hour_pct") is not None:
         active = None
 
     if active:
         claude_verdict = "limited"
-    elif active_live is not None or (sl and sl.get("fresh")):
+    elif active_live is not None:
         claude_verdict = "ok"
     elif active_probe_status == "rate-limited":
         # Endpoint 429 with auth passing: the account is limited or the
@@ -224,7 +208,6 @@ def build(live: bool = True, timeout: float = 15.0, transcript_hours: float = 24
         "tier": creds.get("tier"),
         "keychain": {k: v for k, v in creds.items() if not k.startswith("_")},
         "oauth_probe": {k: v for k, v in cprobe.items() if k != "raw"},
-        "statusline": sl,
         "recent_errors": events[:8],
         "active_limit": active,
         "verdict": claude_verdict,

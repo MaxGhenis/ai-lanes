@@ -1,9 +1,10 @@
-"""Filesystem locations, all overridable via env for tests."""
+"""Filesystem locations shared by the monitor and dispatchers."""
 
 import os
+import re
 from pathlib import Path
 
-HOME = Path.home()
+from . import config
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -12,37 +13,36 @@ def _env_path(name: str, default: Path) -> Path:
 
 
 def codex_homes() -> list[Path]:
-    """CODEX_HOME dirs in canonical dispatch order (~/.codex, ~/.codex-2, ...).
-
-    AI_LANES_CODEX_HOMES (colon-separated) overrides discovery entirely.
-    """
-    override = os.environ.get("AI_LANES_CODEX_HOMES")
-    if override:
-        return [Path(p).expanduser() for p in override.split(":") if p]
-    homes = [HOME / ".codex"] + [HOME / f".codex-{i}" for i in range(2, 10)]
-    return [h for h in homes if h.is_dir()]
+    """Configured homes or numeric ``~/.codex-N`` homes in natural order."""
+    configured = config.codex_homes_setting()
+    if configured is not None:
+        return configured
+    home = Path.home()
+    numbered = []
+    for candidate in home.glob(".codex-*"):
+        match = re.fullmatch(r"\.codex-(\d+)", candidate.name)
+        if match and candidate.is_dir():
+            numbered.append((int(match.group(1)), candidate))
+    homes = [home / ".codex", *(path for _, path in sorted(numbered))]
+    return [path for path in homes if path.is_dir()]
 
 
 def primary_codex_home() -> Path:
     """The home shared with the Codex desktop app / ChatGPT app gauge."""
     homes = codex_homes()
-    return homes[0] if homes else HOME / ".codex"
+    return homes[0] if homes else Path.home() / ".codex"
 
 
 def state_dir() -> Path:
-    return _env_path("AI_LANES_STATE_DIR", HOME / ".local" / "state" / "ai-lanes")
+    return config.state_dir()
 
 
 def claude_dir() -> Path:
-    return _env_path("AI_LANES_CLAUDE_DIR", HOME / ".claude")
+    return _env_path("AI_LANES_CLAUDE_DIR", Path.home() / ".claude")
 
 
 def claude_json() -> Path:
-    return _env_path("AI_LANES_CLAUDE_JSON", HOME / ".claude.json")
-
-
-def notify_bin() -> Path:
-    return _env_path("AI_LANES_NOTIFY", HOME / ".local" / "bin" / "notify")
+    return _env_path("AI_LANES_CLAUDE_JSON", Path.home() / ".claude.json")
 
 
 def snapshot_path() -> Path:
@@ -57,13 +57,21 @@ def history_path() -> Path:
     return state_dir() / "history.jsonl"
 
 
-def brief_path() -> Path:
-    return state_dir() / "brief.md"
-
-
-def statusline_state_path() -> Path:
-    return state_dir() / "claude-statusline.json"
-
-
 def rollout_cache_path() -> Path:
     return state_dir() / "rollout-scan-cache.json"
+
+
+def oauth_raw_path() -> Path:
+    return state_dir() / "claude-oauth-raw.json"
+
+
+def cooldowns_path() -> Path:
+    return state_dir() / "cooldowns.json"
+
+
+def rotation_path() -> Path:
+    return state_dir() / "rotation.json"
+
+
+def decisions_path() -> Path:
+    return state_dir() / "decisions.jsonl"
