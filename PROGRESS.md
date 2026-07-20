@@ -2,7 +2,7 @@
 
 ## State
 
-The source package has been copied and renamed under `ai_lanes`; source trees remain read-only inputs.
+The public extraction is complete; source trees remained read-only inputs and all release gates pass.
 
 ## Done
 
@@ -15,7 +15,9 @@ The source package has been copied and renamed under `ai_lanes`; source trees re
 - Removed statusline and report-generation integrations while retaining the generic watch cycle.
 - Added repo-relative CLI shims, generalized dispatcher discovery, and both hardened runners.
 - Adapted 95 inherited cases and added 48 public config/dispatch/hardening cases; all 143 pass.
+- Proved clean-environment fake-picker and live-machine dry runs route build work to Sol.
+- Passed shell syntax/static checks and the hard scrub gate (only permitted author metadata matches).
 
 ## Next
 
-- Run clean/live dry-run proofs, packaging checks, and the hard scrub gate.
+- None for this extraction; human-facing README prose remains intentionally stubbed.
