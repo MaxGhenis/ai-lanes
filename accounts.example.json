@@ -1,0 +1,11 @@
+{
+  "_comment": "accounts lists the full roster; enrolled maps an account email to its secret-store item name",
+  "enrolled": {
+    "user1@example.com": "claude-quota-user1@example.com"
+  },
+  "accounts": [
+    "user1@example.com",
+    "user2@example.com"
+  ]
+}
+

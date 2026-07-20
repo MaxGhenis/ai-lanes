@@ -1,0 +1,17 @@
+[project]
+name = "ai-lanes"
+version = "0.1.0"
+description = "Multi-account AI subscription monitoring and hardened task dispatch"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "Max Ghenis"}]
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
