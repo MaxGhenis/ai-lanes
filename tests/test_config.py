@@ -124,6 +124,19 @@ class TestSecretNamesAndCommands:
         assert config.command("secret_store_cmd") == ["secret-tool", "--profile", "test"]
         assert config.command("notify_cmd") is None
 
+    def test_invalid_explicit_command_fails_closed(self, monkeypatch):
+        config.save({**BASE, "secret_store_cmd": {"executable": "secret-tool"}})
+
+        def run(*args, **kwargs):
+            raise AssertionError("invalid config fell back to the default store")
+
+        monkeypatch.setattr(secret_store.subprocess, "run", run)
+        with pytest.raises(config.ConfigError, match="secret_store_cmd"):
+            config.command("secret_store_cmd")
+        assert secret_store.get("lane-alpha") is None
+        assert secret_store.set("lane-alpha", "test-token") is False
+        assert secret_store.delete("lane-alpha") is False
+
 
 class TestDefaultSecretStore:
     def test_security_get(self, monkeypatch):
@@ -182,7 +195,7 @@ class TestDefaultSecretStore:
         prefix = [str(helper), "--profile", "test"]
         assert calls[0][0] == [*prefix, "get", "lane-alpha"]
         assert calls[1][0] == [*prefix, "set", "lane-alpha"]
-        assert calls[1][1]["input"] == "test-token"
+        assert calls[1][1]["input"] == "test-token\n"
         assert calls[2][0] == [*prefix, "del", "lane-alpha"]
 
     def test_store_failures_are_non_throwing(self, monkeypatch):

@@ -63,3 +63,14 @@ def test_failed_hook_reports_error(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "9" in captured.err
     assert "transport unavailable" in captured.err
+
+
+def test_invalid_hook_configuration_fails_closed(monkeypatch, capsys):
+    config.save({**BASE, "notify_cmd": {"executable": "notify-helper"}})
+
+    def fail(*args, **kwargs):
+        raise AssertionError("invalid config invoked a command")
+
+    monkeypatch.setattr(notify.subprocess, "run", fail)
+    assert notify.send("quota warning", "One lane remains.") is False
+    assert "configuration error" in capsys.readouterr().err

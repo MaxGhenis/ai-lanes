@@ -122,14 +122,14 @@ def command(key: str) -> list[str] | None:
     if env_name and env_name in os.environ:
         value: Any = os.environ[env_name]
     else:
-        value = load().get(key)
+        value = load(strict=True).get(key)
     if value is None or value == "" or value == []:
         return None
     if isinstance(value, str):
         try:
             return shlex.split(value) or None
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise ConfigError(f"invalid {key}: {exc}") from exc
     if isinstance(value, list) and all(isinstance(item, str) and item for item in value):
         return list(value)
-    return None
+    raise ConfigError(f"{key} must be a command string, an argv list, or null")

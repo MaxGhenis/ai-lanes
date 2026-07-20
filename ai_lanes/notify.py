@@ -15,7 +15,11 @@ def send(subject: str, body: str, *, dry_run: bool = False,
     if dry_run:
         print(f"[dry-run] ALERT: {message}\n", file=sys.stderr)
         return True
-    command = config.command("notify_cmd")
+    try:
+        command = config.command("notify_cmd")
+    except config.ConfigError as exc:
+        print(f"ai-lanes: notify hook configuration error: {exc}", file=sys.stderr)
+        return False
     if not command:
         print(f"ALERT: {message}\n", file=sys.stderr)
         return True

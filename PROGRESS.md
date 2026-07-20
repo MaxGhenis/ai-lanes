@@ -14,7 +14,7 @@ The source package has been copied and renamed under `ai_lanes`; source trees re
 - Added the shared accounts/config, XDG state, secret-store, and notification layers.
 - Removed statusline and report-generation integrations while retaining the generic watch cycle.
 - Added repo-relative CLI shims, generalized dispatcher discovery, and both hardened runners.
-- Adapted 95 inherited cases and added 46 public config/dispatch/hardening cases; all 141 pass.
+- Adapted 95 inherited cases and added 48 public config/dispatch/hardening cases; all 143 pass.
 
 ## Next
 

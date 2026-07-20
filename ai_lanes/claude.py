@@ -160,9 +160,10 @@ def rank_lanes(rows: list[dict], handicap: float = ACTIVE_HANDICAP,
 
 def lanes_fleet(rows: list[dict], handicap: float = ACTIVE_HANDICAP,
                 min_headroom: float = DEFAULT_MIN_HEADROOM) -> dict:
-    """Fleet summary + per-lane verdicts for the snapshot, table, watchdog, and
-    menu bar app. earliest_reset is the soonest any currently-exhausted lane
-    becomes dispatchable."""
+    """Fleet summary + per-lane verdicts for snapshots and monitoring.
+
+    ``earliest_reset`` is the soonest any exhausted lane becomes dispatchable.
+    """
     now = now_local()
     ranked = rank_lanes(rows, handicap=handicap, min_headroom=min_headroom)
     lanes = []

@@ -16,7 +16,10 @@ def _runner(runner: Runner | None) -> Runner:
 
 
 def get(name: str, *, runner: Runner | None = None) -> str | None:
-    custom = config.command("secret_store_cmd")
+    try:
+        custom = config.command("secret_store_cmd")
+    except config.ConfigError:
+        return None
     argv = (
         [*custom, "get", name]
         if custom
@@ -31,10 +34,13 @@ def get(name: str, *, runner: Runner | None = None) -> str | None:
 
 
 def set(name: str, value: str, *, runner: Runner | None = None) -> bool:
-    custom = config.command("secret_store_cmd")
+    try:
+        custom = config.command("secret_store_cmd")
+    except config.ConfigError:
+        return False
     if custom:
         argv = [*custom, "set", name]
-        kwargs = {"input": value, "capture_output": True, "text": True, "timeout": 30}
+        kwargs = {"input": value + "\n", "capture_output": True, "text": True, "timeout": 30}
     else:
         argv = [
             "security", "add-generic-password", "-U", "-a", getpass.getuser(),
@@ -48,7 +54,10 @@ def set(name: str, value: str, *, runner: Runner | None = None) -> bool:
 
 
 def delete(name: str, *, runner: Runner | None = None) -> bool:
-    custom = config.command("secret_store_cmd")
+    try:
+        custom = config.command("secret_store_cmd")
+    except config.ConfigError:
+        return False
     argv = (
         [*custom, "del", name]
         if custom

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import config
+from .util import atomic_write_json
 
 JUDGMENT_PATTERNS = (
     r"review", r"adjudicat", r"referee", r"judge", r"assess", r"critique",
@@ -104,8 +105,7 @@ def _load_cooldowns() -> dict[str, str]:
 
 def _save_cooldowns(data: dict[str, str]) -> None:
     path = _state_dir() / "cooldowns.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    atomic_write_json(path, data)
 
 
 def _rotation() -> dict[str, str]:
@@ -117,8 +117,7 @@ def _rotation() -> dict[str, str]:
 
 def _set_last_used(email: str) -> None:
     path = _state_dir() / "rotation.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"last_used": email}, indent=2) + "\n")
+    atomic_write_json(path, {"last_used": email})
 
 
 def _enrolled() -> list[str]:

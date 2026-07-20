@@ -235,7 +235,7 @@ def cmd_enroll(args) -> int:
     config.save(cfg)
     extracted = {k: probe.get(k) for k in ("five_hour", "seven_day") if probe.get(k)}
     print(f"enrolled {email} -> secret store item {secret}; probe ok"
-          + (f" {json.dumps(extracted)}" if extracted else " (no window fields recognized — raw kept in snapshots)"))
+          + (f" {json.dumps(extracted)}" if extracted else " (no window fields recognized)"))
     return 0
 
 
