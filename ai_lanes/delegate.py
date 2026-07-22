@@ -14,14 +14,33 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import config
-from .util import atomic_write_json
+from . import capacity, config
+from .util import atomic_write_json, parse_iso
 
-JUDGMENT_PATTERNS = (
-    r"review", r"adjudicat", r"referee", r"judge", r"assess", r"critique",
-    r"decide", r"verdict", r"write", r"draft", r"prose", r"essay", r"email",
-    r"blog post", r"voice", r"wdyt", r"strategy", r"design doc",
-    r"recommend",
+FABLE_PATTERNS = (
+    r"\bas max\b",
+    r"\bvoice\b",
+    r"\bemail\b",
+    r"\bblog\b",
+    r"\bessay\b",
+    r"\bprose\b",
+    r"\badjudicat\w*\b",
+    r"\bverdict\b",
+    r"\bfinal review\b",
+    r"\bmerge gate\b",
+    r"\blaunch\b",
+    r"\bsend\b",
+    r"\bdesign\b",
+    r"\bstrategy\b",
+    r"\bwdyt\b",
+)
+REVIEW_PATTERNS = (
+    r"\breview\b",
+    r"\bassess\b",
+    r"\bcritique\b",
+    r"\baudit\b",
+    r"\bevaluate\b",
+    r"\breferee\b",
 )
 SWEEP_PATTERNS = (r"for each", r"per-file", r"per-item", r"per-row", r"batch of", r"enumerate", r"across all")
 MECHANICAL_PATTERNS = (r"verify", r"count", r"list", r"extract", r"check")
@@ -32,6 +51,7 @@ MODEL_NAMES = {
     "fable": "claude-fable-5", "haiku": "claude-haiku-4-5-20251001",
     "sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra",
 }
+CLAUDE_OVERFLOW_MODEL = {"build": "fable", "review": "fable", "sweep": "haiku"}
 PREAMBLE_WRITE = ("Standing orders: commit after every coherent step; create and maintain a committed "
                   "PROGRESS.md (state/done/next) from the start; write your final report to the output file.")
 PREAMBLE_AUDIT = "Frame this as a defensive correctness and completeness audit."
@@ -77,22 +97,30 @@ def _matches(prompt: str, patterns: Sequence[str]) -> list[str]:
 
 def classify(prompt: str, forced: str | None = None) -> tuple[str, dict[str, list[str]]]:
     signals = {
-        "judgment": _matches(prompt, JUDGMENT_PATTERNS),
+        "fable": _matches(prompt, FABLE_PATTERNS),
+        "review": _matches(prompt, REVIEW_PATTERNS),
         "sweep": _matches(prompt, SWEEP_PATTERNS),
         "mechanical": _matches(prompt, MECHANICAL_PATTERNS),
         "build": _matches(prompt, BUILD_PATTERNS),
     }
     if forced:
         return forced, signals
-    if signals["judgment"]:
-        return "judgment", signals
+    if signals["fable"]:
+        return "fable", signals
+    if signals["review"]:
+        return "review", signals
     if signals["sweep"] and signals["mechanical"]:
         return "sweep", signals
     return "build", signals
 
 
 def choose_model(task_class: str, explicit: str | None = None) -> str:
-    return explicit or {"judgment": "fable", "sweep": "terra", "build": "sol"}[task_class]
+    return explicit or {
+        "fable": "fable",
+        "review": "sol",
+        "sweep": "terra",
+        "build": "sol",
+    }[task_class]
 
 
 def _load_cooldowns() -> dict[str, str]:
@@ -141,26 +169,62 @@ def _active_desktop_email() -> str | None:
         return None
 
 
-def pick_fable_lane(exclude: set[str] | None = None) -> str | None:
+def _row_headroom(row: dict[str, Any]) -> float:
+    remaining = []
+    for key in ("five_hour", "weekly"):
+        reading = row.get(key)
+        if isinstance(reading, dict) and reading.get("remaining_percent") is not None:
+            try:
+                remaining.append(float(reading["remaining_percent"]))
+            except (TypeError, ValueError):
+                pass
+    return min(remaining) if remaining else 100.0
+
+
+def pick_fable_lane(
+    exclude: set[str] | None = None,
+    capacity_rows: Sequence[dict[str, Any]] | None = None,
+) -> str | None:
     """Pick and persist one optimistic Claude lane; the sole replaceable seam."""
     exclude = exclude or set()
     now = _now()
     cooldowns = _load_cooldowns()
+    scores = None
+    if capacity_rows is not None:
+        scores = {
+            str(row.get("resource") or row.get("email")): _row_headroom(row)
+            for row in capacity_rows
+            if row.get("family") == "claude" and row.get("dispatchable")
+        }
     live = []
     for email in _enrolled():
         try:
             until = datetime.fromisoformat(cooldowns.get(email, ""))
         except ValueError:
             until = now - timedelta(seconds=1)
-        if email not in exclude and until <= now:
+        if email not in exclude and until <= now and (scores is None or email in scores):
             live.append(email)
     if not live:
         return None
+    if scores is not None:
+        best_score = max(scores[email] for email in live)
+        live = [email for email in live if scores[email] == best_score]
     last = _rotation().get("last_used")
     if last in live:
         pos = (live.index(last) + 1) % len(live)
         live = live[pos:] + live[:pos]
-    active = _active_desktop_email()
+    active = (
+        next(
+            (
+                str(row.get("email"))
+                for row in capacity_rows or []
+                if row.get("family") == "claude" and row.get("active") and row.get("email")
+            ),
+            None,
+        )
+        if capacity_rows is not None
+        else _active_desktop_email()
+    )
     if len(live) > 1 and live[0] == active:
         live.append(live.pop(0))
     picked = live[0]
@@ -175,6 +239,11 @@ def record_cooldown(email: str, until: datetime) -> None:
 
 
 def _limited_until(text: str) -> datetime:
+    absolute = re.search(r"hard limit reset=([^\s]+)", text, re.IGNORECASE)
+    if absolute:
+        parsed = parse_iso(absolute.group(1))
+        if parsed is not None and parsed > _now():
+            return parsed
     match = re.search(r"resets\s+(\d{1,2}):(\d{2})\s*(am|pm)", text, re.IGNORECASE)
     now = _now()
     if not match:
@@ -194,7 +263,7 @@ def _append_decision(record: dict[str, Any]) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="delegate")
-    p.add_argument("-t", choices=("judgment", "build", "sweep"))
+    p.add_argument("-t", choices=("fable", "review", "build", "sweep"))
     p.add_argument("-m", choices=("fable", "sol", "terra", "haiku"))
     resources = p.add_mutually_exclusive_group()
     resources.add_argument("-a", metavar="EMAIL")
@@ -248,18 +317,6 @@ def _prompt_text(args: argparse.Namespace, parser: argparse.ArgumentParser) -> s
     return args.prompt
 
 
-def _codex_home() -> tuple[str | None, str]:
-    try:
-        cp = subprocess.run(
-            [_discover_tool("codex-pick", "DELEGATE_CODEX_PICK")],
-            capture_output=True,
-            text=True,
-        )
-    except OSError as exc:
-        return None, str(exc) + "\n"
-    return (cp.stdout.strip() if cp.returncode == 0 and cp.stdout.strip() else None), cp.stderr
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -271,12 +328,89 @@ def main(argv: Sequence[str] | None = None) -> int:
     task_class, signals = classify(prompt, args.t)
     model = choose_model(task_class, args.m)
     family = MODEL_FAMILY[model]
+    requested_family = family
     if args.a and family != "claude":
         parser.error("-a is only valid with fable or haiku")
     if args.H and family != "codex":
         parser.error("-H is only valid with sol or terra")
     sandbox = args.s or ("workspace-write" if task_class == "build" else "read-only")
     overrides = {k: v for k, v in {"class": args.t, "model": args.m, "lane": args.a, "home": args.H, "sandbox": args.s}.items() if v is not None}
+
+    capacity_error = None
+    try:
+        capacity_report = capacity.build()
+        capacity_rows: list[dict[str, Any]] | None = capacity_report.get("accounts") or []
+    except Exception as exc:
+        capacity_error = str(exc)
+        capacity_rows = None
+        capacity_report = {
+            "generated_at": _now().isoformat(),
+            "cache": {"hit": False, "error": capacity_error},
+            "accounts": [],
+            "families": {
+                "codex": {"score": 0.0, "best_resource": None,
+                          "earliest_reset": None, "dispatchable": 0},
+                "claude": {"score": 0.0, "best_resource": None,
+                           "earliest_reset": None, "dispatchable": 0},
+            },
+        }
+    scores = capacity_report.get("families") or {}
+    codex_score = float((scores.get("codex") or {}).get("score") or 0.0)
+    claude_score = float((scores.get("claude") or {}).get("score") or 0.0)
+    codex_rows = [row for row in (capacity_rows or []) if row.get("family") == "codex"]
+    cross_family_note = None
+    if (
+        args.m is None
+        and args.H is None
+        and family == "codex"
+        and codex_rows
+        and codex_score <= 0
+        and claude_score > 0
+    ):
+        model = CLAUDE_OVERFLOW_MODEL[task_class]
+        family = "claude"
+        cross_family_note = (
+            f"CROSS-FAMILY OVERFLOW: {task_class} defaulted to Codex, but its best "
+            f"dispatchable headroom is {codex_score:.0f}%; routing to Claude "
+            f"({claude_score:.0f}% headroom) as {model}."
+        )
+
+    capacity_context = {
+        "cache": capacity_report.get("cache"),
+        "inputs": capacity_report.get("accounts") or [],
+        "scores": scores,
+    }
+    if capacity_error:
+        capacity_context["error"] = capacity_error
+
+    if (
+        task_class == "fable"
+        and family == "claude"
+        and not args.a
+        and capacity_rows is not None
+        and claude_score <= 0
+    ):
+        earliest = (scores.get("claude") or {}).get("earliest_reset")
+        reason = (
+            "FABLE FLOOR BLOCKED: all Claude lanes are limited or unavailable; "
+            "refusing to downgrade floor work to Sol"
+            + (f" (earliest reset {earliest})" if earliest else "")
+        )
+        print(f"delegate: {reason}", file=sys.stderr)
+        record = {
+            "ts": _now().isoformat(), "class": task_class, "model": model,
+            "family": family, "requested_family": requested_family,
+            "lane/home": None, "signals matched": signals, "overrides": overrides,
+            "capacity": capacity_context, "cross_family": None, "reason": reason,
+            "result": 3, "cmd": [],
+        }
+        _append_decision(record)
+        if args.why:
+            print("delegate decision: " + json.dumps(record, sort_keys=True), file=sys.stderr)
+        return 3
+
+    if cross_family_note:
+        print(f"delegate: WARNING {cross_family_note}", file=sys.stderr)
 
     temp_paths: list[str] = []
     output = args.o
@@ -288,7 +422,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.no_preamble:
         if sandbox == "workspace-write":
             preamble.append(PREAMBLE_WRITE)
-        if task_class == "judgment":
+        if task_class == "review":
             preamble.append(PREAMBLE_AUDIT)
     if preamble:
         contents = "\n".join(preamble) + "\n\n" + prompt
@@ -303,16 +437,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     while True:
         lane_or_home: str | None
         if family == "codex":
-            lane_or_home = args.H
-            pick_error = ""
+            lane_or_home = args.H or (scores.get("codex") or {}).get("best_resource")
             if not lane_or_home:
-                lane_or_home, pick_error = _codex_home()
-            if not lane_or_home:
-                sys.stderr.write(pick_error)
-                if args.overflow and task_class == "build":
-                    print("delegate: WARNING Codex capacity exhausted; overflowing build cross-family to fable", file=sys.stderr)
-                    family, model = "claude", "fable"
+                if args.m is None and args.H is None and claude_score > 0:
+                    model = CLAUDE_OVERFLOW_MODEL[task_class]
+                    family = "claude"
+                    cross_family_note = (
+                        f"CROSS-FAMILY OVERFLOW: no Codex lane is dispatchable; routing "
+                        f"{task_class} to Claude ({claude_score:.0f}% headroom) as {model}."
+                    )
+                    print(f"delegate: WARNING {cross_family_note}", file=sys.stderr)
                     continue
+                reset = (scores.get("codex") or {}).get("earliest_reset")
+                print(
+                    "delegate: no dispatchable Codex lane"
+                    + (f" (earliest reset {reset})" if reset else ""),
+                    file=sys.stderr,
+                )
                 result = 3
                 cmd: list[str] = []
             else:
@@ -329,7 +470,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if args.b: cmd += ["-b", args.b]
                     result = 0 if args.dry_run else subprocess.run(cmd).returncode
         else:
-            lane_or_home = args.a or pick_fable_lane(tried)
+            lane_or_home = args.a or pick_fable_lane(tried, capacity_rows)
             if not lane_or_home or attempts >= 3:
                 cmd = []
                 result = 3
@@ -358,9 +499,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                             record_cooldown(lane_or_home, _now() + timedelta(days=30))
                             print(_reenroll_ritual(lane_or_home), file=sys.stderr)
                         if result in (4, 5) and not args.a and attempts < 3:
-                            attempt_record = {"ts": _now().isoformat(), "class": task_class, "model": model,
-                                              "lane/home": lane_or_home, "signals matched": signals,
-                                              "overrides": overrides, "cmd": cmd}
+                            attempt_record = {
+                                "ts": _now().isoformat(), "class": task_class, "model": model,
+                                "family": family, "requested_family": requested_family,
+                                "lane/home": lane_or_home, "signals matched": signals,
+                                "overrides": overrides, "capacity": capacity_context,
+                                "cross_family": cross_family_note, "result": result, "cmd": cmd,
+                            }
                             _append_decision(attempt_record)
                             if args.why:
                                 print("delegate decision: " + json.dumps(attempt_record, sort_keys=True), file=sys.stderr)
@@ -368,8 +513,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                         if result in (4, 5):
                             result = 3
 
-        record = {"ts": _now().isoformat(), "class": task_class, "model": model,
-                  "lane/home": lane_or_home, "signals matched": signals, "overrides": overrides, "cmd": cmd}
+        if family == "claude" and lane_or_home is None and task_class == "fable":
+            resets = []
+            for raw in _load_cooldowns().values():
+                parsed = parse_iso(raw if isinstance(raw, str) else None)
+                if parsed is not None and parsed > _now():
+                    resets.append(parsed)
+            earliest = min(resets).isoformat() if resets else \
+                (scores.get("claude") or {}).get("earliest_reset")
+            message = "FABLE FLOOR BLOCKED after lane limits; refusing Sol downgrade"
+            if earliest:
+                message += f" (earliest reset {earliest})"
+            print(f"delegate: {message}", file=sys.stderr)
+        record = {
+            "ts": _now().isoformat(), "class": task_class, "model": model,
+            "family": family, "requested_family": requested_family,
+            "lane/home": lane_or_home, "signals matched": signals, "overrides": overrides,
+            "capacity": capacity_context, "cross_family": cross_family_note,
+            "result": result, "cmd": cmd,
+        }
         _append_decision(record)
         if args.why:
             print("delegate decision: " + json.dumps(record, sort_keys=True), file=sys.stderr)

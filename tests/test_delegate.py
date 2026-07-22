@@ -9,15 +9,35 @@ from ai_lanes import config, delegate
 
 
 @pytest.mark.parametrize(("prompt", "kind", "model"), [
-    ("Review this patch", "judgment", "fable"),
-    ("Draft an email for a client", "judgment", "fable"),
-    ("Write an essay", "judgment", "fable"),
-    ("Recommend a strategy", "judgment", "fable"),
-    ("Assess and implement it", "judgment", "fable"),
+    ("Answer as Max", "fable", "fable"),
+    ("Match this voice", "fable", "fable"),
+    ("Prepare an email", "fable", "fable"),
+    ("Create a blog", "fable", "fable"),
+    ("Outline an essay", "fable", "fable"),
+    ("Polish the prose", "fable", "fable"),
+    ("Adjudicating this dispute", "fable", "fable"),
+    ("Give the verdict", "fable", "fable"),
+    ("Run the final review", "fable", "fable"),
+    ("Run the merge gate", "fable", "fable"),
+    ("Prepare the launch", "fable", "fable"),
+    ("Send this now", "fable", "fable"),
+    ("Design the interface", "fable", "fable"),
+    ("Choose a strategy", "fable", "fable"),
+    ("Wdyt about this?", "fable", "fable"),
+    ("Review this patch", "review", "sol"),
+    ("Assess this patch", "review", "sol"),
+    ("Critique this patch", "review", "sol"),
+    ("Audit this patch", "review", "sol"),
+    ("Evaluate this patch", "review", "sol"),
+    ("Referee this dispute", "review", "sol"),
+    ("Final review before we implement the fix", "fable", "fable"),
+    ("As Max, for each file check and implement it", "fable", "fable"),
+    ("Audit and implement the fix", "review", "sol"),
     ("For each file, check imports", "sweep", "terra"),
     ("Extract ids across all rows", "sweep", "terra"),
     ("Count a batch of records", "sweep", "terra"),
     ("For each feature implement it", "build", "sol"),
+    ("Implement the voicemail redesign launcher", "build", "sol"),
     ("Implement the endpoint", "build", "sol"),
     ("Fix and test the bug", "build", "sol"),
     ("Refactor the parser", "build", "sol"),
@@ -31,8 +51,52 @@ def test_routing_table(prompt, kind, model):
 def test_overrides_and_haiku_only_explicit():
     kind, _ = delegate.classify("review this", "build")
     assert (kind, delegate.choose_model(kind, "terra")) == ("build", "terra")
-    assert delegate.choose_model("judgment") != "haiku"
+    assert delegate.choose_model("fable") != "haiku"
     assert delegate.choose_model("build", "haiku") == "haiku"
+
+
+def capacity_report(*, codex=None, claude=None, codex_score=0, claude_score=100,
+                    claude_reset=None):
+    codex = list(codex or [])
+    claude = list(claude or [])
+    return {
+        "generated_at": "2026-07-22T12:00:00-04:00",
+        "cache": {"checked_at": "2026-07-22T12:00:00-04:00", "hit": True,
+                  "ttl_seconds": 120},
+        "accounts": [*codex, *claude],
+        "families": {
+            "codex": {
+                "score": codex_score,
+                "best_resource": next(
+                    (row["resource"] for row in codex if row.get("dispatchable")), None
+                ),
+                "earliest_reset": None,
+                "dispatchable": sum(bool(row.get("dispatchable")) for row in codex),
+            },
+            "claude": {
+                "score": claude_score,
+                "best_resource": next(
+                    (row["resource"] for row in claude if row.get("dispatchable")), None
+                ),
+                "earliest_reset": claude_reset,
+                "dispatchable": sum(bool(row.get("dispatchable")) for row in claude),
+            },
+        },
+    }
+
+
+def claude_capacity_row(email, *, dispatchable=True, limited_until=None):
+    return {
+        "family": "claude", "id": email, "email": email, "home": None,
+        "resource": email,
+        "five_hour": {"unit": "tokens", "tokens": 0, "capacity": None,
+                      "remaining_percent": None},
+        "weekly": {"unit": "tokens", "tokens": 0, "capacity": None,
+                   "remaining_percent": None},
+        "learned_capacity": None, "limited_until": limited_until,
+        "confidence": "estimated", "dispatchable": dispatchable,
+        "status": "estimated", "enrolled": True,
+    }
 
 
 @pytest.fixture
@@ -59,6 +123,12 @@ def isolated(tmp_path, monkeypatch):
     )
     state = config.state_dir()
     monkeypatch.setattr(delegate, "_active_desktop_email", lambda: None)
+    lanes = [
+        claude_capacity_row(email)
+        for email in ("alpha@example.com", "beta@example.com", "charlie@example.com",
+                      "delta@example.com")
+    ]
+    monkeypatch.setattr(delegate.capacity, "build", lambda: capacity_report(claude=lanes))
     return state
 
 
@@ -101,19 +171,123 @@ def test_rc5_long_cooldown_and_ritual(isolated, monkeypatch, capsys):
     assert delegate.datetime.fromisoformat(until) > delegate._now() + timedelta(days=29)
 
 
-def test_codex_no_lane_and_overflow(isolated, monkeypatch, capsys):
+def test_no_codex_capacity_overflows_automatically(isolated, monkeypatch, capsys):
     calls = []
-    monkeypatch.setattr(delegate.subprocess, "run", fake_run_factory([(1, "", "reset 4pm\n"), (0, "ok", "")], calls))
+    monkeypatch.setattr(
+        delegate.subprocess,
+        "run",
+        fake_run_factory([(0, "ok", "")], calls),
+    )
     out = isolated / "out"
-    assert delegate.main(["implement x", "-o", str(out)]) == 3
-    assert "reset 4pm" in capsys.readouterr().err
-    calls.clear()
-    monkeypatch.setattr(delegate.subprocess, "run", fake_run_factory([(1, "", "none\n"), (0, "ok", "")], calls))
-    assert delegate.main(["--overflow", "implement x", "-o", str(out)]) == 0
-    assert "cross-family" in capsys.readouterr().err
+    assert delegate.main(["implement x", "-o", str(out)]) == 0
+    err = capsys.readouterr().err
+    assert "cross-family" in err.lower()
+    assert any("claude-lane" in cmd[0] for cmd in calls)
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected_sandbox", "audit_preamble"),
+    [
+        ("Implement the endpoint", "workspace-write", False),
+        ("Audit and implement the endpoint", "read-only", True),
+    ],
+)
+def test_exhausted_codex_capacity_overflows_elastic_classes(
+    isolated, monkeypatch, capsys, prompt, expected_sandbox, audit_preamble
+):
+    reset = (delegate._now() + timedelta(hours=1)).isoformat()
+    codex_row = {
+        "family": "codex", "id": "codex-1", "email": "codex@example.com",
+        "home": "/home/codex", "resource": "/home/codex",
+        "five_hour": {"unit": "percent", "used_percent": 100,
+                      "remaining_percent": 0, "reset_at": reset},
+        "weekly": {"unit": "percent", "used_percent": 50,
+                   "remaining_percent": 50, "reset_at": None},
+        "learned_capacity": None, "limited_until": reset, "confidence": "live",
+        "dispatchable": False, "status": "ok",
+    }
+    lane = claude_capacity_row("alpha@example.com")
+    monkeypatch.setattr(
+        delegate.capacity,
+        "build",
+        lambda: capacity_report(codex=[codex_row], claude=[lane], claude_score=100),
+    )
+    seen = []
+
+    def run(cmd, **kwargs):
+        seen.append((cmd, Path(cmd[cmd.index("-p") + 1]).read_text()))
+        return CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(delegate.subprocess, "run", run)
+
+    assert delegate.main(["--why", prompt, "-o", str(isolated / "out")]) == 0
+
+    cmd, merged_prompt = seen[0]
+    assert "claude-lane" in cmd[0]
+    assert cmd[cmd.index("-m") + 1] == delegate.MODEL_NAMES["fable"]
+    assert cmd[cmd.index("-s") + 1] == expected_sandbox
+    assert (delegate.PREAMBLE_AUDIT in merged_prompt) is audit_preamble
+    assert "cross-family overflow" in capsys.readouterr().err.lower()
+    decision = json.loads((isolated / "decisions.jsonl").read_text().splitlines()[-1])
+    assert decision["capacity"]["scores"]["codex"]["score"] == 0
+    assert decision["capacity"]["scores"]["claude"]["score"] == 100
+    assert decision["family"] == "claude" and decision["cross_family"]
+
+
+def test_all_claude_limited_fable_floor_fails_fast(isolated, monkeypatch, capsys):
+    reset = (delegate._now() + timedelta(hours=2)).isoformat()
+    lanes = [
+        claude_capacity_row(email, dispatchable=False, limited_until=reset)
+        for email in ("alpha@example.com", "beta@example.com", "charlie@example.com",
+                      "delta@example.com")
+    ]
+    monkeypatch.setattr(
+        delegate.capacity,
+        "build",
+        lambda: capacity_report(
+            claude=lanes, claude_score=0, claude_reset=reset,
+        ),
+    )
+    monkeypatch.setattr(
+        delegate.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("floor failure dispatched a runner"),
+    )
+
+    assert delegate.main(["--why", "Send the final email", "-o", str(isolated / "out")]) == 3
+
+    err = capsys.readouterr().err
+    assert "fable floor blocked" in err.lower()
+    assert "refusing to downgrade" in err.lower()
+    assert reset in err
+    decision = json.loads((isolated / "decisions.jsonl").read_text().splitlines()[-1])
+    assert decision["cmd"] == []
+    assert decision["capacity"]["scores"]["claude"]["earliest_reset"] == reset
 
 
 def test_preamble_defaults_off_dry_run_and_decision(isolated, monkeypatch, capsys):
+    codex_row = {
+        "family": "codex", "id": "codex-1", "email": "codex@example.com",
+        "home": "/home/codex", "resource": "/home/codex",
+        "five_hour": {"unit": "percent", "used_percent": 20,
+                      "remaining_percent": 80, "reset_at": None},
+        "weekly": {"unit": "percent", "used_percent": 30,
+                   "remaining_percent": 70, "reset_at": None},
+        "learned_capacity": None, "limited_until": None, "confidence": "live",
+        "dispatchable": True, "status": "ok",
+    }
+    lanes = [
+        claude_capacity_row(email)
+        for email in ("alpha@example.com", "beta@example.com", "charlie@example.com",
+                      "delta@example.com")
+    ]
+    monkeypatch.setattr(
+        delegate.capacity,
+        "build",
+        lambda: capacity_report(
+            codex=[codex_row], claude=lanes, codex_score=70, claude_score=100,
+        ),
+    )
     seen = []
     def run(cmd, **kwargs):
         if cmd[-1:] == ["--json"] or "status" in cmd:

@@ -12,12 +12,12 @@ a token, workers pin an identity per process, and a router picks lanes for you.
 
 | tool | what it does |
 |------|--------------|
-| `delegate` | One entry point for dispatching agent work. Classifies the prompt (judgment / build / sweep), picks a model family and an account with headroom, injects standing orders, and shells to the hardened runners below. `--why` explains every decision; `--dry-run` shows the command without running it. |
-| `ai-lanes` | Quota/auth monitor across all lanes: per-account windows, observed limit events, alerting via a configurable `notify_cmd`. |
+| `delegate` | One entry point for dispatching agent work. Classifies the prompt (fable / review / build / sweep), picks a model family and an account with headroom, injects standing orders, and shells to the hardened runners below. `--why` explains routing and capacity decisions; `--dry-run` shows the command without running it. |
+| `ai-lanes` | Quota/auth monitor across all lanes, including `capacity [--json]` for a cross-family 5h + weekly view, observed limit events, and alerting via a configurable `notify_cmd`. |
 | `codex-pick` | Prints the best `CODEX_HOME` right now (distinct-account and rate-window aware). |
-| `claude-pick` | Same idea for Claude lanes, from observed limit events (see [findings](#findings) for why live probing is impossible). |
+| `claude-pick` | Prints the best enrolled Claude lane for direct wrapper use. |
 | `codex-run` | Hardened `codex exec`: retries transient deaths, fixes the worktree sandbox-git failure, snapshots uncommitted work to `refs/codex-salvage/*` on any exit, supports `-e <effort>`. |
-| `claude-lane` | Hardened headless `claude` pinned to a lane via `CLAUDE_CODE_OAUTH_TOKEN`: retries transients, fails fast on hard limits (rc 4) and dead tokens (rc 5), salvages to `refs/claude-salvage/*`, and checks the transcript afterward for silent model substitution. |
+| `claude-lane` | Hardened headless `claude` pinned to a lane via `CLAUDE_CODE_OAUTH_TOKEN`: retries transients, records transcript token usage, fails fast on hard limits (rc 4) and dead tokens (rc 5), salvages to `refs/claude-salvage/*`, and checks the transcript afterward for silent model substitution. |
 
 Runtime is stdlib-only Python. macOS keychain is the default secret store; any
 command that speaks `get`/`set`/`del` can replace it in config.
@@ -49,9 +49,12 @@ Dispatch:
 
 ```bash
 delegate "Fix the failing retry test"                    # → build → codex lane, ultra effort
-delegate "Review this diff and write an assessment"      # → judgment → Claude lane, read-only
+delegate "Review and assess this diff"                   # → review → Sol, read-only audit
+delegate "Final review and launch verdict"               # → fable floor → Claude, read-only
 delegate "For each of the 40 files, verify the header"   # → sweep → cheap codex model
 delegate -m fable -a you@example.com -C ~/proj -p task.md -o out.md   # full override
+ai-lanes capacity                                        # human cross-family table
+ai-lanes capacity --json                                 # machine-readable view
 ```
 
 ## Routing rules
@@ -59,17 +62,39 @@ delegate -m fable -a you@example.com -C ~/proj -p task.md -o out.md   # full ove
 Classification is deliberate, transparent regex — not a model call — so every
 route is explainable and testable:
 
-- **judgment** (review, adjudicate, write, draft, assess, decide, …) → Claude
-  family lane, read-only by default. Any judgment signal wins even when build
-  signals are present: misrouted judgment fails *silently*, so the asymmetry
-  errs toward the family this toolkit reserves for it.
+- **fable floor** (`as max`; voice/email/blog/essay/prose; adjudication,
+  verdict, final review, merge gate, launch/send; design/strategy/wdyt) → Claude,
+  read-only by default. Any fable signal wins over every other class.
+- **review** (review, assess, critique, audit, evaluate, referee) → Sol,
+  read-only, with a defensive correctness-and-completeness audit preamble.
 - **sweep** (per-item mechanical verification at scale) → the cheap fast model.
 - **build** (everything else) → the strong codex model at max reasoning
   effort, workspace-write, behind whatever tests and gates your prompt sets.
 
-Resource selection: codex lanes rank by live usage windows; Claude lanes
-rotate optimistically and record observed cooldowns on hard limits, because
-live probing is impossible for lane tokens (below).
+Precedence is `fable > review > sweep > build`: review beats build, while the
+fable floor cannot be diluted by mixed signals. Build, review, and sweep are
+elastic: if Codex is exhausted or limited and a Claude lane has headroom,
+`delegate` crosses families automatically and calls it out in `--why`. Fable
+work instead fails fast with the earliest reset when every Claude lane is
+limited; it never silently downgrades to Sol.
+
+## Capacity model
+
+`ai-lanes capacity [--json]` reports one row per account across both families,
+including 5h and weekly use, any learned token capacity, cooldown, and a
+confidence label. Live Codex usage comes from each `CODEX_HOME`; the active
+Claude desktop login is also probed live through its keychain app token. Live
+readings have `live` confidence and are cached for 120 seconds so delegation
+stays fast.
+
+Claude setup-token lanes are different: their inference-only scope cannot read
+usage. After each run, `claude-lane` instead appends transcript token totals to
+`lane-usage.jsonl`, and the monitor computes rolling 5h and 7d estimates per
+email. Before calibration, `estimated` readings report raw token sums with no
+claimed capacity. A hard-limit observation records the window totals and
+reset, learns the largest observed capacity for each window, and gives the
+calibrated reading `observed` confidence. Existing rc 4/5 cooldowns supply
+`limited_until`.
 
 ## Findings
 

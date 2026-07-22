@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -89,19 +90,44 @@ def test_delegate_shim_dry_run_uses_temp_config_and_shared_state(tmp_path):
     workdir = tmp_path / "work"
     config_dir.mkdir(exist_ok=True)
     workdir.mkdir()
+    codex_home = "/tmp/example-codex-home"
     (config_dir / "accounts.json").write_text(
-        json.dumps({"accounts": [], "enrolled": {}, "codex_homes": []})
+        json.dumps({"accounts": [], "enrolled": {}, "codex_homes": [codex_home]})
     )
-    picker = make_executable(
-        tmp_path / "tools" / "codex-pick",
-        "#!/bin/sh\nprintf '%s\\n' '/tmp/example-codex-home'\n",
+    checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    capacity_state = state_home / "ai-lanes"
+    capacity_state.mkdir(parents=True)
+    (capacity_state / "capacity-cache.json").write_text(
+        json.dumps(
+            {
+                "checked_at": checked_at,
+                "codex": [
+                    {
+                        "home": codex_home,
+                        "auth": {
+                            "status": "ok", "home": codex_home,
+                            "account_id": "example-account", "email": "lane@example.com",
+                        },
+                        "probe": {
+                            "status": "ok", "checked_at": checked_at, "allowed": True,
+                            "limit_reached": False,
+                            "primary": {"used_percent": 10, "reset_at": None},
+                            "secondary": {"used_percent": 20, "reset_at": None},
+                        },
+                    }
+                ],
+                "claude": {
+                    "identity": {}, "credentials": {"status": "skipped"},
+                    "probe": {"status": "skipped"},
+                },
+            }
+        )
     )
     env = {
         **os.environ,
         "AI_LANES_CONFIG_DIR": str(config_dir),
         "XDG_STATE_HOME": str(state_home),
         "HOME": str(tmp_path / "home"),
-        "DELEGATE_CODEX_PICK": str(picker),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
 
@@ -122,4 +148,4 @@ def test_delegate_shim_dry_run_uses_temp_config_and_shared_state(tmp_path):
     decisions = state_home / "ai-lanes" / "decisions.jsonl"
     records = [json.loads(line) for line in decisions.read_text().splitlines()]
     assert records[-1]["model"] == "sol"
-    assert records[-1]["lane/home"] == "/tmp/example-codex-home"
+    assert records[-1]["lane/home"] == codex_home
