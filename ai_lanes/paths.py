@@ -75,3 +75,11 @@ def rotation_path() -> Path:
 
 def decisions_path() -> Path:
     return state_dir() / "decisions.jsonl"
+
+
+def lane_usage_path() -> Path:
+    return state_dir() / "lane-usage.jsonl"
+
+
+def capacity_cache_path() -> Path:
+    return state_dir() / "capacity-cache.json"

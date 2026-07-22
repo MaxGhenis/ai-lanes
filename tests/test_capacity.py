@@ -1,0 +1,336 @@
+import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from ai_lanes import capacity, config, paths
+
+
+NOW = datetime(2026, 7, 22, 16, 0, tzinfo=timezone.utc)
+
+
+def at(delta: timedelta) -> str:
+    return (NOW + delta).isoformat(timespec="seconds")
+
+
+def token_record(email: str, delta: timedelta, total: int) -> dict:
+    return {
+        "ts": at(delta),
+        "email": email,
+        "session_id": f"s-{total}",
+        "input_tokens": total,
+        "output_tokens": 0,
+        "total_tokens": total,
+    }
+
+
+def test_transcript_last_message_occurrence_wins_and_append_errors(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        "\n".join(
+            json.dumps(value)
+            for value in (
+                {
+                    "sessionId": "session-1",
+                    "message": {"id": "m1", "usage": {"input_tokens": 10, "output_tokens": 2}},
+                },
+                {"message": {"id": "m2", "usage": {"input_tokens": 7, "output_tokens": 3}}},
+                {"message": {"id": "m1", "usage": {"input_tokens": 11, "output_tokens": 5}}},
+            )
+        )
+    )
+    ledger = tmp_path / "lane-usage.jsonl"
+
+    parsed = capacity.parse_transcript_usage(transcript)
+    appended = capacity.append_lane_usage(
+        "lane@example.com", transcript, ts=NOW, ledger_path=ledger
+    )
+
+    assert parsed == {
+        "session_id": "session-1",
+        "input_tokens": 18,
+        "output_tokens": 8,
+        "total_tokens": 26,
+    }
+    assert appended["total_tokens"] == 26
+
+    broken = tmp_path / "broken.jsonl"
+    broken.write_text("{not json\n")
+    error = capacity.append_lane_usage(
+        "lane@example.com", broken, ts=NOW, ledger_path=ledger
+    )
+    no_usage = tmp_path / "no-usage.jsonl"
+    no_usage.write_text(json.dumps({"message": {"id": "m3", "content": []}}) + "\n")
+    missing = capacity.append_lane_usage(
+        "lane@example.com", no_usage, ts=NOW, ledger_path=ledger
+    )
+    records = capacity.read_ledger(ledger)
+    assert "error" in error
+    assert "no message usage" in missing["error"]
+    assert records == [appended, error, missing]
+
+
+def test_rolling_windows_are_inclusive_and_ignore_future_errors_and_events():
+    email = "lane@example.com"
+    entries = [
+        token_record(email, -timedelta(hours=5), 10),
+        token_record(email, -timedelta(hours=5, seconds=1), 20),
+        token_record(email, -timedelta(days=7), 30),
+        token_record(email, -timedelta(days=7, seconds=1), 40),
+        token_record(email, timedelta(seconds=1), 50),
+        {"ts": at(-timedelta(hours=1)), "email": email, "error": "bad"},
+        {
+            "ts": at(-timedelta(hours=1)),
+            "email": email,
+            "event": "hard_limit",
+            "window_tokens_5h": 999,
+            "window_tokens_7d": 999,
+        },
+        token_record("other@example.com", -timedelta(minutes=1), 1000),
+    ]
+
+    assert capacity.rolling_token_sums(email, now=NOW, entries=entries) == {
+        "five_hour": 10,
+        "weekly": 60,
+    }
+
+
+def test_hard_limit_records_windows_and_learns_maxima(tmp_path):
+    email = "lane@example.com"
+    ledger = tmp_path / "lane-usage.jsonl"
+    entries = [
+        token_record(email, -timedelta(hours=1), 60),
+        {
+            "ts": at(-timedelta(days=8)),
+            "email": email,
+            "event": "hard_limit",
+            "window_tokens_5h": 100,
+            "window_tokens_7d": 200,
+            "reset": None,
+        },
+        {
+            "ts": at(-timedelta(days=1)),
+            "email": email,
+            "event": "hard_limit",
+            "window_tokens_5h": 120,
+            "window_tokens_7d": 180,
+            "reset": None,
+        },
+    ]
+
+    event = capacity.record_hard_limit(
+        email,
+        reset=NOW + timedelta(hours=2),
+        ts=NOW,
+        entries=entries,
+        ledger_path=ledger,
+    )
+
+    assert event["window_tokens_5h"] == 60
+    assert event["window_tokens_7d"] == 60
+    assert event["learned_capacity"] == {"five_hour": 120, "weekly": 200}
+    assert capacity.read_ledger(ledger) == [event]
+    assert capacity.learned_capacities(email, entries=[*entries, event]) == {
+        "five_hour": 120,
+        "weekly": 200,
+    }
+
+
+def test_account_rows_calibration_active_merge_and_family_scoring():
+    lane = "lane@example.com"
+    entries = [
+        token_record(lane, -timedelta(hours=1), 50),
+        {
+            "ts": at(-timedelta(days=1)),
+            "email": lane,
+            "event": "hard_limit",
+            "window_tokens_5h": 100,
+            "window_tokens_7d": 200,
+            "reset": at(-timedelta(hours=1)),
+        },
+    ]
+    live = {
+        "codex": [
+            {
+                "home": "/h/c1",
+                "auth": {"status": "ok", "account_id": "c1", "email": "c1@example.com"},
+                "probe": {
+                    "status": "ok",
+                    "allowed": True,
+                    "limit_reached": False,
+                    "primary": {"used_percent": 20, "reset_at": at(timedelta(hours=1))},
+                    "secondary": {"used_percent": 50, "reset_at": at(timedelta(days=1))},
+                },
+            },
+            {
+                "home": "/h/c2",
+                "auth": {"status": "ok", "account_id": "c2", "email": "c2@example.com"},
+                "probe": {
+                    "status": "ok",
+                    "allowed": True,
+                    "limit_reached": False,
+                    "primary": {"used_percent": 40, "reset_at": at(timedelta(hours=1))},
+                    "secondary": {"used_percent": 10, "reset_at": at(timedelta(days=1))},
+                },
+            },
+        ],
+        "claude": {
+            "identity": {"email": lane},
+            "credentials": {"status": "ok"},
+            "probe": {
+                "status": "ok",
+                "five_hour": {"used_percent": 25, "reset_at": at(timedelta(hours=2))},
+                "seven_day": {"used_percent": 30, "reset_at": at(timedelta(days=2))},
+            },
+        },
+    }
+
+    rows = capacity.account_rows(
+        live,
+        now=NOW,
+        entries=entries,
+        enrolled={lane: "secret"},
+        known_accounts=[lane, "fresh@example.com"],
+        cooldowns={},
+    )
+    by_id = {row["id"]: row for row in rows}
+
+    assert by_id[lane]["confidence"] == "live"
+    assert by_id[lane]["five_hour"]["used_percent"] == 25
+    assert by_id[lane]["learned_capacity"] == {"five_hour": 100, "weekly": 200}
+    assert by_id["fresh@example.com"]["five_hour"]["capacity"] is None
+    scores = capacity.family_scores(rows, now=NOW)
+    assert scores["codex"]["best_resource"] == "/h/c2"
+    assert scores["codex"]["score"] == 60
+    assert scores["claude"]["best_resource"] == lane
+    assert scores["claude"]["score"] == 70
+
+
+def test_family_score_optimistic_uncalibrated_and_all_limited_reset():
+    reset = NOW + timedelta(hours=3)
+    available = {
+        "family": "claude",
+        "id": "fresh@example.com",
+        "resource": "fresh@example.com",
+        "five_hour": capacity._token_reading(123, None),
+        "weekly": capacity._token_reading(456, None),
+        "limited_until": None,
+        "dispatchable": True,
+    }
+    limited = {
+        **available,
+        "id": "limited@example.com",
+        "resource": "limited@example.com",
+        "limited_until": reset.isoformat(timespec="seconds"),
+        "dispatchable": False,
+    }
+
+    assert capacity.family_score([available, limited], "claude", now=NOW)["score"] == 100
+    summary = capacity.family_score([limited], "claude", now=NOW)
+    assert summary["score"] == 0
+    assert summary["best_resource"] is None
+    assert summary["earliest_reset"] == reset.isoformat(timespec="seconds")
+
+
+def test_live_probe_cache_ttl_and_sanitization(tmp_path):
+    cache_file = tmp_path / "capacity-cache.json"
+    calls = {"codex": 0, "claude": 0}
+
+    def homes():
+        return [tmp_path / "codex-home"]
+
+    def auth(home):
+        return {
+            "status": "ok",
+            "home": str(home),
+            "account_id": "acct",
+            "email": "codex@example.com",
+            "_access_token": "codex-secret",
+        }
+
+    def probe_all(auths, timeout):
+        calls["codex"] += 1
+        return [
+            {
+                "status": "ok",
+                "primary": {"used_percent": calls["codex"], "reset_at": None},
+                "secondary": {"used_percent": 2, "reset_at": None},
+            }
+        ]
+
+    def keychain():
+        return {"status": "ok", "_token": "claude-secret"}
+
+    def claude_probe(token, timeout):
+        assert token == "claude-secret"
+        calls["claude"] += 1
+        return {"status": "ok", "five_hour": {"used_percent": calls["claude"]}}
+
+    kwargs = {
+        "cache_path": cache_file,
+        "codex_homes_fn": homes,
+        "read_auth_fn": auth,
+        "probe_all_fn": probe_all,
+        "claude_identity_fn": lambda: {"email": "lane@example.com"},
+        "keychain_fn": keychain,
+        "claude_probe_fn": claude_probe,
+    }
+    first = capacity.get_live_probes(now=NOW, **kwargs)
+    edge = capacity.get_live_probes(now=NOW + timedelta(seconds=120), **kwargs)
+    stale = capacity.get_live_probes(now=NOW + timedelta(seconds=121), **kwargs)
+
+    assert first["cache_hit"] is False
+    assert edge["cache_hit"] is True
+    assert stale["cache_hit"] is False
+    assert calls == {"codex": 2, "claude": 2}
+    serialized = cache_file.read_text()
+    assert "codex-secret" not in serialized
+    assert "claude-secret" not in serialized
+    assert not any(key.startswith("_") for key in json.loads(serialized)["codex"][0]["auth"])
+
+
+def test_live_probe_skips_keychain_and_oauth_without_active_identity(tmp_path):
+    def forbidden():
+        pytest.fail("keychain accessed without an active desktop identity")
+
+    live = capacity.get_live_probes(
+        now=NOW,
+        cache_path=tmp_path / "cache.json",
+        codex_homes_fn=lambda: [],
+        claude_identity_fn=lambda: {"email": None},
+        keychain_fn=forbidden,
+        claude_probe_fn=lambda *args, **kwargs: pytest.fail("oauth probed without active identity"),
+    )
+
+    assert live["claude"]["credentials"]["status"] == "skipped"
+    assert live["claude"]["probe"]["status"] == "skipped"
+
+
+def test_build_uses_tmp_state_paths_and_has_report_shape(tmp_path):
+    config.save(
+        {
+            "accounts": ["lane@example.com"],
+            "enrolled": {"lane@example.com": "lane-secret"},
+            "codex_homes": [],
+        }
+    )
+    report = capacity.build(
+        clock=lambda: NOW,
+        cache_path=tmp_path / "cache.json",
+        ledger_path=tmp_path / "ledger.jsonl",
+        cooldowns_path=tmp_path / "cooldowns.json",
+        codex_homes_fn=lambda: [],
+        claude_identity_fn=lambda: {"email": "lane@example.com"},
+        keychain_fn=lambda: {"status": "ok", "_token": "secret"},
+        claude_probe_fn=lambda token, timeout: {
+            "status": "ok",
+            "five_hour": {"used_percent": 10},
+            "seven_day": {"used_percent": 20},
+        },
+    )
+
+    assert set(report) == {"generated_at", "cache", "accounts", "families"}
+    assert report["accounts"][0]["resource"] == "lane@example.com"
+    assert report["families"]["claude"]["score"] == 80
+    assert paths.lane_usage_path().name == "lane-usage.jsonl"
+    assert paths.capacity_cache_path().name == "capacity-cache.json"
