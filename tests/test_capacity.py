@@ -136,6 +136,87 @@ def test_hard_limit_records_windows_and_learns_maxima(tmp_path):
     }
 
 
+def test_pending_hard_limit_fallback_expires_or_is_cleared_by_later_usage():
+    email = "lane@example.com"
+    live = {"codex": [], "claude": {"identity": {}, "probe": {"status": "skipped"}}}
+    success = token_record(email, -timedelta(hours=2), 10)
+    event = {
+        "ts": at(-timedelta(minutes=30)),
+        "email": email,
+        "event": "hard_limit",
+        "window_tokens_5h": 0,
+        "window_tokens_7d": 0,
+        "reset": "not-a-reset",
+    }
+
+    limited = capacity.account_rows(
+        live,
+        now=NOW,
+        entries=[success, event],
+        enrolled={email: "secret"},
+        known_accounts=[email],
+        cooldowns={},
+    )[0]
+    assert limited["pending_hard_limit"] is True
+    assert limited["dispatchable"] is False
+    assert limited["limited_until"] == at(timedelta(minutes=30))
+    assert capacity.family_score([limited], "claude", now=NOW) == {
+        "score": 0.0,
+        "best_resource": None,
+        "earliest_reset": at(timedelta(minutes=30)),
+        "dispatchable": 0,
+    }
+
+    later_success = token_record(email, -timedelta(minutes=10), 5)
+    cleared = capacity.account_rows(
+        live,
+        now=NOW,
+        entries=[success, event, later_success],
+        enrolled={email: "secret"},
+        known_accounts=[email],
+        cooldowns={},
+    )[0]
+    assert cleared["pending_hard_limit"] is False
+    assert cleared["limited_until"] is None
+    assert cleared["dispatchable"] is True
+
+    expired_event = {**event, "ts": at(-timedelta(hours=2))}
+    expired = capacity.account_rows(
+        live,
+        now=NOW,
+        entries=[success, expired_event],
+        enrolled={email: "secret"},
+        known_accounts=[email],
+        cooldowns={},
+    )[0]
+    assert expired["pending_hard_limit"] is False
+    assert expired["dispatchable"] is True
+
+    past_reset = {**event, "reset": at(-timedelta(minutes=1))}
+    reset_passed = capacity.account_rows(
+        live,
+        now=NOW,
+        entries=[success, past_reset],
+        enrolled={email: "secret"},
+        known_accounts=[email],
+        cooldowns={},
+    )[0]
+    assert reset_passed["pending_hard_limit"] is False
+    assert reset_passed["dispatchable"] is True
+
+    future_success = token_record(email, timedelta(minutes=10), 5)
+    still_limited = capacity.account_rows(
+        live,
+        now=NOW,
+        entries=[success, event, future_success],
+        enrolled={email: "secret"},
+        known_accounts=[email],
+        cooldowns={},
+    )[0]
+    assert still_limited["pending_hard_limit"] is True
+    assert still_limited["dispatchable"] is False
+
+
 def test_account_rows_calibration_active_merge_and_family_scoring():
     lane = "lane@example.com"
     entries = [
@@ -206,6 +287,61 @@ def test_account_rows_calibration_active_merge_and_family_scoring():
     assert scores["claude"]["score"] == 70
 
 
+def test_claude_email_matching_is_case_insensitive_and_preserves_config_spelling():
+    configured = "Lane@Example.com"
+    entries = [
+        token_record("LANE@example.COM", -timedelta(hours=1), 50),
+        {
+            "ts": at(-timedelta(minutes=30)),
+            "email": "lane@EXAMPLE.com",
+            "event": "hard_limit",
+            "window_tokens_5h": 100,
+            "window_tokens_7d": 200,
+            "reset": None,
+        },
+    ]
+    live = {
+        "codex": [],
+        "claude": {
+            "identity": {"email": "lAnE@eXaMpLe.CoM"},
+            "probe": {
+                "status": "ok",
+                "five_hour": {"used_percent": 10},
+                "seven_day": {"used_percent": 20},
+            },
+        },
+    }
+    cooldown = at(timedelta(hours=3))
+
+    rows = capacity.account_rows(
+        live,
+        now=NOW,
+        entries=entries,
+        enrolled={"lane@example.COM": "secret"},
+        known_accounts=[configured],
+        cooldowns={"LANE@EXAMPLE.COM": cooldown},
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["id"] == configured
+    assert row["resource"] == "lane@example.COM"
+    assert row["active"] is True and row["enrolled"] is True
+    assert row["confidence"] == "live"
+    assert row["learned_capacity"] == {"five_hour": 100, "weekly": 200}
+    assert row["pending_hard_limit"] is True
+    assert row["limited_until"] == cooldown
+    assert row["dispatchable"] is False
+    assert capacity.rolling_token_sums("lane@example.com", now=NOW, entries=entries) == {
+        "five_hour": 50,
+        "weekly": 50,
+    }
+    assert capacity.learned_capacities("LANE@example.com", entries=entries) == {
+        "five_hour": 100,
+        "weekly": 200,
+    }
+
+
 def test_family_score_optimistic_uncalibrated_and_all_limited_reset():
     reset = NOW + timedelta(hours=3)
     available = {
@@ -230,6 +366,31 @@ def test_family_score_optimistic_uncalibrated_and_all_limited_reset():
     assert summary["score"] == 0
     assert summary["best_resource"] is None
     assert summary["earliest_reset"] == reset.isoformat(timespec="seconds")
+
+
+def test_family_earliest_reset_filters_explicitly_ineligible_rows():
+    soon = at(timedelta(hours=1))
+    legacy = at(timedelta(hours=2))
+    later = at(timedelta(hours=3))
+    claude_rows = [
+        {"family": "claude", "enrolled": False, "limited_until": soon},
+        {"family": "claude", "limited_until": legacy},
+        {"family": "claude", "enrolled": True, "limited_until": later},
+    ]
+    assert capacity.family_score(claude_rows, "claude", now=NOW)["earliest_reset"] == legacy
+    assert capacity.family_score(
+        [claude_rows[0], claude_rows[2]], "claude", now=NOW
+    )["earliest_reset"] == later
+
+    codex_rows = [
+        {"family": "codex", "auth_status": "missing", "limited_until": soon},
+        {"family": "codex", "limited_until": legacy},
+        {"family": "codex", "auth_status": "ok", "limited_until": later},
+    ]
+    assert capacity.family_score(codex_rows, "codex", now=NOW)["earliest_reset"] == legacy
+    assert capacity.family_score(
+        [codex_rows[0], codex_rows[2]], "codex", now=NOW
+    )["earliest_reset"] == later
 
 
 def test_live_probe_cache_ttl_and_sanitization(tmp_path):
@@ -304,6 +465,36 @@ def test_live_probe_skips_keychain_and_oauth_without_active_identity(tmp_path):
 
     assert live["claude"]["credentials"]["status"] == "skipped"
     assert live["claude"]["probe"]["status"] == "skipped"
+
+
+def test_fresh_malformed_cache_is_a_miss_and_reprobes(tmp_path):
+    cache_file = tmp_path / "cache.json"
+    cache_file.write_text(json.dumps({"checked_at": NOW.isoformat(), "codex": []}))
+    calls = {"homes": 0, "identity": 0}
+
+    def homes():
+        calls["homes"] += 1
+        return []
+
+    def identity():
+        calls["identity"] += 1
+        return {"email": None}
+
+    live = capacity.get_live_probes(
+        now=NOW + timedelta(seconds=1),
+        cache_path=cache_file,
+        codex_homes_fn=homes,
+        claude_identity_fn=identity,
+    )
+
+    assert live["cache_hit"] is False
+    assert calls == {"homes": 1, "identity": 1}
+    cached = json.loads(cache_file.read_text())
+    assert isinstance(cached["codex"], list)
+    assert all(
+        isinstance(cached["claude"][key], dict)
+        for key in ("identity", "credentials", "probe")
+    )
 
 
 def test_build_uses_tmp_state_paths_and_has_report_shape(tmp_path):

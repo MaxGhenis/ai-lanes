@@ -13,6 +13,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -235,6 +236,154 @@ def test_codex_run_salvages_dirty_tree_without_moving_head_or_index(tmp_path):
     assert _git(repo, "show", f"{salvage_ref}:tracked.txt") == "after"
     assert _git(repo, "show", f"{salvage_ref}:untracked.txt") == "also saved"
     assert "salvaged dirty state" in result.stderr
+
+
+def test_claude_lane_detach_keeps_prompt_until_child_finishes(tmp_path):
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_ai_lanes = _fake_ai_lanes_with_usage(fake_bin)
+    invocation = tmp_path / "detach.invocation"
+    release = tmp_path / "detach.release"
+    done = tmp_path / "detach.done"
+    prompt_capture = tmp_path / "detach.prompt"
+    _write_executable(
+        fake_bin / "nohup",
+        """#!/usr/bin/env bash
+set -u
+{
+  printf 'marker=%s\n' "${CLAUDE_LANE_DETACHED-}"
+  printf 'prompt=%s\n' "${CLAUDE_LANE_DETACHED_PROMPT-}"
+  printf 'arg=%s\n' "$@"
+} >"$DETACH_INVOCATION_LOG"
+while [ ! -e "$DETACH_RELEASE" ]; do
+  /bin/sleep 0.01
+done
+"$@"
+rc=$?
+printf '%s\n' "$rc" >"$DETACH_DONE"
+exit "$rc"
+""",
+    )
+    fake_claude = _write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+set -u
+session=""
+requested=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id) shift; session=$1 ;;
+    --model) shift; requested=$1 ;;
+  esac
+  shift
+done
+[ -n "$session" ] && [ -n "$requested" ] || exit 92
+cat >"$DETACH_CHILD_PROMPT_CAPTURE"
+project_key=$(printf '%s' "$PWD" | tr '/.' '--')
+project_dir="$FAKE_CLAUDE_DIR/projects/$project_key"
+mkdir -p "$project_dir"
+printf '{"type":"assistant","message":{"id":"message-1","model":"%s","usage":{"input_tokens":2,"output_tokens":3}}}\n' \
+  "$requested" >"$project_dir/$session.jsonl"
+printf '{"is_error":false,"result":"detached result"}\n'
+""",
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    durable_dir = tmp_path / "durable"
+    durable_dir.mkdir()
+    original_prompt = tmp_path / "ephemeral-prompt.txt"
+    original_prompt.write_text("prompt survives launcher exit\n")
+    output = tmp_path / "answer.md"
+    claude_dir = tmp_path / "claude-state"
+    state_dir = tmp_path / "ai-lanes-state"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "TMPDIR": os.fspath(durable_dir),
+        "DETACH_INVOCATION_LOG": os.fspath(invocation),
+        "DETACH_RELEASE": os.fspath(release),
+        "DETACH_DONE": os.fspath(done),
+        "DETACH_CHILD_PROMPT_CAPTURE": os.fspath(prompt_capture),
+        "CLAUDE_LANE_AI_LANES": os.fspath(fake_ai_lanes),
+        "CLAUDE_LANE_CLAUDE": os.fspath(fake_claude),
+        "CLAUDE_LANE_CLAUDE_DIR": os.fspath(claude_dir),
+        "FAKE_CLAUDE_DIR": os.fspath(claude_dir),
+        "AI_LANES_STATE_DIR": os.fspath(state_dir),
+        "PYTHONPATH": os.fspath(ROOT),
+        "WRAPPER_PYTHON": sys.executable,
+    }
+
+    launcher = _run(
+        "bash",
+        BIN / "claude-lane",
+        "-d",
+        "-a",
+        "lane@example.com",
+        "-s",
+        "read-only",
+        "-C",
+        workdir,
+        "-p",
+        original_prompt,
+        "-o",
+        output,
+        "--",
+        env=env,
+    )
+
+    assert launcher.returncode == 0, launcher.stderr
+    assert "detached pid=" in launcher.stdout
+    deadline = time.monotonic() + 5
+    while not invocation.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert invocation.is_file()
+    lines = invocation.read_text().splitlines()
+    detached_prompt = Path(
+        next(line.removeprefix("prompt=") for line in lines if line.startswith("prompt="))
+    )
+    args = [line.removeprefix("arg=") for line in lines if line.startswith("arg=")]
+    try:
+        assert "marker=1" in lines
+        assert args[-2:] == ["-p", os.fspath(detached_prompt)]
+        assert detached_prompt.is_file()
+        assert detached_prompt.read_text() == original_prompt.read_text()
+        original_prompt.unlink()
+    finally:
+        release.touch()
+        deadline = time.monotonic() + 5
+        while not done.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    assert done.read_text().strip() == "0"
+    assert prompt_capture.read_text() == "prompt survives launcher exit\n"
+    assert output.read_text() == "detached result\n"
+    assert not detached_prompt.exists()
+
+
+def test_claude_lane_detach_fails_when_prompt_copy_cannot_be_created(tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("detached prompt")
+    env = {**os.environ, "TMPDIR": os.fspath(tmp_path / "missing-tmp")}
+
+    result = _run(
+        "bash",
+        BIN / "claude-lane",
+        "-d",
+        "-a",
+        "lane@example.com",
+        "-C",
+        workdir,
+        "-p",
+        prompt,
+        "-o",
+        tmp_path / "answer.md",
+        env=env,
+    )
+
+    assert result.returncode == 2
+    assert "could not create a durable prompt copy" in result.stderr
 
 
 def test_claude_lane_scrubs_api_keys_and_marks_transcript_model_mismatch(tmp_path):

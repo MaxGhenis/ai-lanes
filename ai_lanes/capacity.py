@@ -49,6 +49,26 @@ def _token_count(value: Any) -> int | None:
     return number if number >= 0 else None
 
 
+def _email_key(value: Any) -> str | None:
+    """Case-insensitive account key; callers keep a separate display spelling."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().casefold()
+
+
+def _record_matches_email(record: Any, email: str) -> bool:
+    return isinstance(record, dict) and _email_key(record.get("email")) == _email_key(email)
+
+
+def _successful_usage_record(record: Any) -> bool:
+    return (
+        isinstance(record, dict)
+        and not record.get("error")
+        and not record.get("event")
+        and _token_count(record.get("total_tokens")) is not None
+    )
+
+
 def read_ledger(path: Path | str | None = None) -> list[dict]:
     """Read valid object records from the lane ledger, ignoring torn lines."""
     ledger = Path(path) if path is not None else paths.lane_usage_path()
@@ -171,7 +191,7 @@ def rolling_token_sums(
     five_hour = 0
     weekly = 0
     for record in records:
-        if not isinstance(record, dict) or record.get("email") != email:
+        if not _record_matches_email(record, email):
             continue
         if record.get("error") or record.get("event"):
             continue
@@ -199,7 +219,7 @@ def learned_capacities(
     five_hour: int | None = None
     weekly: int | None = None
     for record in records:
-        if not isinstance(record, dict) or record.get("email") != email:
+        if not _record_matches_email(record, email):
             continue
         if record.get("event") != "hard_limit":
             continue
@@ -248,6 +268,14 @@ def record_hard_limit(
 
 
 def _cache_is_fresh(cache: dict, now: datetime, ttl_seconds: float) -> bool:
+    if not isinstance(cache, dict) or not isinstance(cache.get("codex"), list):
+        return False
+    claude_cache = cache.get("claude")
+    if not isinstance(claude_cache, dict) or not all(
+        isinstance(claude_cache.get(key), dict)
+        for key in ("identity", "credentials", "probe")
+    ):
+        return False
     checked = parse_iso(cache.get("checked_at")) if isinstance(cache, dict) else None
     if checked is None:
         return False
@@ -401,16 +429,51 @@ def _cooldown_value(value: Any) -> str | None:
     return None
 
 
-def _event_resets(entries: Iterable[dict], email: str, now: datetime) -> list[datetime]:
+def _hard_limit_deadline(record: dict, now: datetime) -> datetime | None:
+    """Future reset, or the one-hour rc4 fallback for a missing reset."""
+    reset_value = record.get("reset")
+    parsed_reset = (
+        parse_iso(reset_value)
+        if isinstance(reset_value, str)
+        else reset_value if isinstance(reset_value, datetime) else None
+    )
+    if parsed_reset is not None:
+        parsed_reset = _aware(parsed_reset)
+        return parsed_reset if parsed_reset > now else None
+    observed = parse_iso(record.get("ts"))
+    if observed is None:
+        return None
+    fallback = _aware(observed) + timedelta(hours=1)
+    return fallback if fallback > now else None
+
+
+def _pending_hard_limit_resets(
+    entries: Iterable[dict], email: str, now: datetime
+) -> list[datetime]:
+    """Active hard limits since the lane's latest successful ledger run.
+
+    Ledger order is authoritative because adjacent usage and hard-limit records
+    can share the same second-resolution timestamp.  A later successful run
+    proves older observed limits stale and clears them.
+    """
+    records = list(entries)
+    last_success = -1
+    for index, record in enumerate(records):
+        observed = parse_iso(record.get("ts")) if isinstance(record, dict) else None
+        if (
+            _record_matches_email(record, email)
+            and _successful_usage_record(record)
+            and observed is not None
+            and _aware(observed) <= now
+        ):
+            last_success = index
     resets: list[datetime] = []
-    for record in entries:
-        if not isinstance(record, dict) or record.get("email") != email:
+    for record in records[last_success + 1:]:
+        if not _record_matches_email(record, email) or record.get("event") != "hard_limit":
             continue
-        if record.get("event") != "hard_limit":
-            continue
-        reset = _future(record.get("reset"), now)
-        if reset:
-            resets.append(reset)
+        deadline = _hard_limit_deadline(record, now)
+        if deadline is not None:
+            resets.append(deadline)
     return resets
 
 
@@ -455,6 +518,7 @@ def _codex_account_row(item: dict, now: datetime) -> dict:
         "confidence": "live",
         "dispatchable": dispatchable,
         "status": status,
+        "auth_status": auth.get("status"),
     }
 
 
@@ -488,10 +552,22 @@ def account_rows(
     if enrolled is None:
         value = cfg.get("enrolled") or {}
         enrolled = value if isinstance(value, dict) else {}
-    enrolled_emails = set(enrolled if not isinstance(enrolled, Mapping) else enrolled.keys())
+    if isinstance(enrolled, Mapping):
+        enrolled_values = list(enrolled.keys())
+    elif isinstance(enrolled, str):
+        enrolled_values = [enrolled]
+    else:
+        enrolled_values = list(enrolled)
+    enrolled_by_key = {
+        key: value.strip()
+        for value in enrolled_values
+        if (key := _email_key(value)) is not None
+    }
+    enrolled_keys = set(enrolled_by_key)
     if known_accounts is None:
         value = cfg.get("accounts") or []
         known_accounts = value if isinstance(value, list) else []
+    known_values = [known_accounts] if isinstance(known_accounts, str) else list(known_accounts)
 
     by_codex_id: dict[str, dict] = {}
     for item in live.get("codex") or []:
@@ -504,29 +580,43 @@ def account_rows(
     claude_live = live.get("claude") if isinstance(live.get("claude"), dict) else {}
     identity = claude_live.get("identity") if isinstance(claude_live.get("identity"), dict) else {}
     active_email = identity.get("email")
+    active_key = _email_key(active_email)
     probe = claude_live.get("probe") if isinstance(claude_live.get("probe"), dict) else {}
 
-    emails = {
-        value for value in known_accounts
-        if isinstance(value, str) and value
-    }
-    emails.update(value for value in enrolled_emails if isinstance(value, str) and value)
-    emails.update(
-        record.get("email") for record in records
-        if isinstance(record, dict) and isinstance(record.get("email"), str)
-    )
-    if isinstance(active_email, str) and active_email:
-        emails.add(active_email)
+    display_by_key: dict[str, str] = {}
+
+    def remember_display(value: Any) -> None:
+        key = _email_key(value)
+        if key is not None and key not in display_by_key:
+            display_by_key[key] = value.strip()
+
+    # Public config spelling is canonical; ledger and active-login variants
+    # merge into it without changing the resource passed to lane runners.
+    for value in known_values:
+        remember_display(value)
+    for value in enrolled_values:
+        remember_display(value)
+    for record in records:
+        if isinstance(record, dict):
+            remember_display(record.get("email"))
+    remember_display(active_email)
+
+    cooldowns_by_key: dict[str, list[Any]] = {}
+    for cooldown_email, cooldown_value in cooldowns.items():
+        key = _email_key(cooldown_email)
+        if key is not None:
+            cooldowns_by_key.setdefault(key, []).append(cooldown_value)
 
     claude_rows: list[dict] = []
-    for email in sorted(emails):
+    for email_key in sorted(display_by_key, key=lambda key: display_by_key[key].casefold()):
+        email = display_by_key[email_key]
         sums = rolling_token_sums(email, now=current, entries=records)
         learned = learned_capacities(email, entries=records)
         five_hour = _token_reading(sums["five_hour"], learned["five_hour"])
         weekly = _token_reading(sums["weekly"], learned["weekly"])
         confidence = "observed" if any(learned.values()) else "estimated"
         status = confidence
-        active = email == active_email
+        active = email_key == active_key
         if active and probe.get("status") == "ok":
             five_hour = _percent_reading(probe.get("five_hour")) or five_hour
             weekly = _percent_reading(probe.get("seven_day")) or weekly
@@ -536,10 +626,12 @@ def account_rows(
             confidence = "live"
             status = "rate-limited"
 
-        resets = _event_resets(records, email, current)
-        cooldown = _future(_cooldown_value(cooldowns.get(email)), current)
-        if cooldown:
-            resets.append(cooldown)
+        pending_limit_resets = _pending_hard_limit_resets(records, email, current)
+        resets = list(pending_limit_resets)
+        for cooldown_value in cooldowns_by_key.get(email_key, []):
+            cooldown = _future(_cooldown_value(cooldown_value), current)
+            if cooldown:
+                resets.append(cooldown)
         live_exhausted = False
         for reading in (five_hour, weekly):
             if reading and reading.get("used_percent") is not None \
@@ -549,10 +641,12 @@ def account_rows(
                 if reset:
                     resets.append(reset)
         limited_until = iso(max(resets)) if resets else None
-        is_enrolled = email in enrolled_emails
+        is_enrolled = email_key in enrolled_keys
+        resource = enrolled_by_key.get(email_key, email)
         dispatchable = (
             is_enrolled
             and limited_until is None
+            and not pending_limit_resets
             and not live_exhausted
             and status != "rate-limited"
         )
@@ -563,7 +657,7 @@ def account_rows(
                 "id": email,
                 "email": email,
                 "home": None,
-                "resource": email,
+                "resource": resource,
                 "five_hour": five_hour,
                 "weekly": weekly,
                 "learned_capacity": learned_value,
@@ -573,6 +667,7 @@ def account_rows(
                 "status": status,
                 "active": active,
                 "enrolled": is_enrolled,
+                "pending_hard_limit": bool(pending_limit_resets),
             }
         )
 
@@ -616,13 +711,29 @@ def family_score(
 ) -> dict[str, Any]:
     current = _resolve_now(now)
     family_rows = [row for row in rows if isinstance(row, dict) and row.get("family") == family]
+
+    def reset_eligible(row: dict) -> bool:
+        if family == "claude" and row.get("enrolled") is False:
+            return False
+        if family == "codex" and row.get("auth_status") not in (None, "ok"):
+            return False
+        return True
+
     future_resets = [
-        reset for reset in (_future(row.get("limited_until"), current) for row in family_rows)
+        reset for reset in (
+            _future(row.get("limited_until"), current)
+            for row in family_rows
+            if reset_eligible(row)
+        )
         if reset is not None
     ]
     candidates: list[tuple[float, str, dict]] = []
     for row in family_rows:
-        if not row.get("dispatchable") or _future(row.get("limited_until"), current):
+        if (
+            not row.get("dispatchable")
+            or row.get("pending_hard_limit")
+            or _future(row.get("limited_until"), current)
+        ):
             continue
         score = _row_score(row)
         candidates.append((score, str(row.get("resource") or row.get("id") or ""), row))

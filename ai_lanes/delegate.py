@@ -238,6 +238,19 @@ def record_cooldown(email: str, until: datetime) -> None:
     _save_cooldowns(data)
 
 
+def _earliest_cooldown_reset() -> str | None:
+    now = _now()
+    enrolled = set(_enrolled())
+    resets = []
+    for email, raw in _load_cooldowns().items():
+        if email not in enrolled:
+            continue
+        parsed = parse_iso(raw if isinstance(raw, str) else None)
+        if parsed is not None and parsed > now:
+            resets.append(parsed)
+    return min(resets).isoformat() if resets else None
+
+
 def _limited_until(text: str) -> datetime:
     absolute = re.search(r"hard limit reset=([^\s]+)", text, re.IGNORECASE)
     if absolute:
@@ -317,7 +330,7 @@ def _prompt_text(args: argparse.Namespace, parser: argparse.ArgumentParser) -> s
     return args.prompt
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None, temp_paths: list[str]) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.status:
@@ -375,10 +388,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"({claude_score:.0f}% headroom) as {model}."
         )
 
+    runtime_limited_lanes: list[dict[str, Any]] = []
     capacity_context = {
         "cache": capacity_report.get("cache"),
         "inputs": capacity_report.get("accounts") or [],
         "scores": scores,
+        "runtime_limited_lanes": runtime_limited_lanes,
     }
     if capacity_error:
         capacity_context["error"] = capacity_error
@@ -412,11 +427,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if cross_family_note:
         print(f"delegate: WARNING {cross_family_note}", file=sys.stderr)
 
-    temp_paths: list[str] = []
     output = args.o
     if not output:
         fd, output = tempfile.mkstemp(prefix="delegate-output-", suffix=".md")
-        os.close(fd); temp_paths.append(output)
+        temp_paths.append(output)
+        os.close(fd)
     contents = prompt
     preamble = []
     if not args.no_preamble:
@@ -427,13 +442,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if preamble:
         contents = "\n".join(preamble) + "\n\n" + prompt
     fd, merged = tempfile.mkstemp(prefix="delegate-prompt-", suffix=".md")
+    temp_paths.append(merged)
     with os.fdopen(fd, "w") as f:
         f.write(contents)
-    temp_paths.append(merged)
 
     tried: set[str] = set()
     attempts = 0
     result = 3
+    reason: str | None = None
     while True:
         lane_or_home: str | None
         if family == "codex":
@@ -474,6 +490,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not lane_or_home or attempts >= 3:
                 cmd = []
                 result = 3
+                if task_class == "fable":
+                    earliest = _earliest_cooldown_reset() or \
+                        (scores.get("claude") or {}).get("earliest_reset")
+                    if attempts >= 3:
+                        reason = (
+                            f"FABLE FLOOR STOPPED: Claude retry cap reached after {attempts} "
+                            "unavailable lane attempts; refusing any Sol downgrade"
+                        )
+                    else:
+                        reason = (
+                            "FABLE FLOOR BLOCKED: no dispatchable Claude lane remains; "
+                            "refusing any Sol downgrade"
+                        )
+                    if earliest:
+                        reason += f" (earliest reset {earliest})"
             else:
                 tried.add(lane_or_home); attempts += 1
                 try:
@@ -493,11 +524,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else:
                         sys.stdout.write(cp.stdout); sys.stderr.write(cp.stderr)
                         result = cp.returncode
+                        cooldown_until = None
                         if result == 4:
-                            record_cooldown(lane_or_home, _limited_until(cp.stderr + cp.stdout))
+                            cooldown_until = _limited_until(cp.stderr + cp.stdout)
+                            record_cooldown(lane_or_home, cooldown_until)
                         elif result == 5:
-                            record_cooldown(lane_or_home, _now() + timedelta(days=30))
+                            cooldown_until = _now() + timedelta(days=30)
+                            record_cooldown(lane_or_home, cooldown_until)
                             print(_reenroll_ritual(lane_or_home), file=sys.stderr)
+                        if result in (4, 5):
+                            runtime_limited_lanes.append(
+                                {
+                                    "resource": lane_or_home,
+                                    "email": lane_or_home,
+                                    "result": result,
+                                    "outcome": "hard_limit" if result == 4 else "auth_failure",
+                                    "limited_until": cooldown_until.isoformat(),
+                                }
+                            )
                         if result in (4, 5) and not args.a and attempts < 3:
                             attempt_record = {
                                 "ts": _now().isoformat(), "class": task_class, "model": model,
@@ -511,26 +555,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 print("delegate decision: " + json.dumps(attempt_record, sort_keys=True), file=sys.stderr)
                             continue
                         if result in (4, 5):
+                            runtime_result = result
                             result = 3
+                            if task_class == "fable":
+                                earliest = _earliest_cooldown_reset() or \
+                                    (scores.get("claude") or {}).get("earliest_reset")
+                                if args.a:
+                                    reason = (
+                                        f"FABLE FLOOR STOPPED: pinned Claude lane became "
+                                        f"unavailable (rc {runtime_result}); refusing any Sol downgrade"
+                                    )
+                                else:
+                                    reason = (
+                                        f"FABLE FLOOR STOPPED: Claude retry cap reached after "
+                                        f"{attempts} unavailable lane attempts; refusing any Sol downgrade"
+                                    )
+                                if earliest:
+                                    reason += f" (earliest reset {earliest})"
 
-        if family == "claude" and lane_or_home is None and task_class == "fable":
-            resets = []
-            for raw in _load_cooldowns().values():
-                parsed = parse_iso(raw if isinstance(raw, str) else None)
-                if parsed is not None and parsed > _now():
-                    resets.append(parsed)
-            earliest = min(resets).isoformat() if resets else \
-                (scores.get("claude") or {}).get("earliest_reset")
-            message = "FABLE FLOOR BLOCKED after lane limits; refusing Sol downgrade"
-            if earliest:
-                message += f" (earliest reset {earliest})"
-            print(f"delegate: {message}", file=sys.stderr)
+        if reason:
+            print(f"delegate: {reason}", file=sys.stderr)
         record = {
             "ts": _now().isoformat(), "class": task_class, "model": model,
             "family": family, "requested_family": requested_family,
             "lane/home": lane_or_home, "signals matched": signals, "overrides": overrides,
             "capacity": capacity_context, "cross_family": cross_family_note,
-            "result": result, "cmd": cmd,
+            "reason": reason, "result": result, "cmd": cmd,
         }
         _append_decision(record)
         if args.why:
@@ -539,10 +589,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(" ".join(__import__("shlex").quote(part) for part in cmd))
         elif result == 0 and not args.o and Path(output).exists():
             sys.stdout.write(Path(output).read_text())
-        for path in temp_paths:
-            try: Path(path).unlink()
-            except OSError: pass
         return result
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    temp_paths: list[str] = []
+    try:
+        return _main(argv, temp_paths)
+    finally:
+        for path in temp_paths:
+            try:
+                Path(path).unlink()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

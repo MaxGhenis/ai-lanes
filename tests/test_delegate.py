@@ -155,10 +155,25 @@ def fake_run_factory(results, calls):
 def test_rc4_cooldown_rotates_and_three_attempt_cap(isolated, monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(delegate.subprocess, "run", fake_run_factory([(4, "", "limit resets 3:15pm")]*3, calls))
-    assert delegate.main(["-m", "fable", "task", "-o", str(isolated / "out")]) == 3
+    assert delegate.main(["--why", "Send the final email", "-o", str(isolated / "out")]) == 3
     assert len(calls) == 3
     assert len(json.loads((isolated / "cooldowns.json").read_text())) == 3
-    assert len((isolated / "decisions.jsonl").read_text().splitlines()) == 3
+    decisions = [
+        json.loads(line) for line in (isolated / "decisions.jsonl").read_text().splitlines()
+    ]
+    assert len(decisions) == 3
+    final = decisions[-1]
+    assert "fable floor stopped" in final["reason"].lower()
+    assert "retry cap" in final["reason"].lower()
+    assert "refusing any sol downgrade" in final["reason"].lower()
+    assert "all claude lanes" not in final["reason"].lower()
+    runtime_limited = final["capacity"]["runtime_limited_lanes"]
+    assert [row["result"] for row in runtime_limited] == [4, 4, 4]
+    assert {row["resource"] for row in runtime_limited} == {
+        "alpha@example.com", "beta@example.com", "charlie@example.com",
+    }
+    err = capsys.readouterr().err.lower()
+    assert "fable floor stopped" in err and "earliest reset" in err
 
 
 def test_rc5_long_cooldown_and_ritual(isolated, monkeypatch, capsys):
@@ -169,6 +184,30 @@ def test_rc5_long_cooldown_and_ritual(isolated, monkeypatch, capsys):
     assert "claude setup-token" in err and "claude-quota-alpha@example.com" in err
     until = next(iter(json.loads((isolated / "cooldowns.json").read_text()).values()))
     assert delegate.datetime.fromisoformat(until) > delegate._now() + timedelta(days=29)
+
+
+def test_temp_paths_are_removed_when_runner_raises(isolated, tmp_path, monkeypatch):
+    created = []
+    real_mkstemp = delegate.tempfile.mkstemp
+
+    def tracked_mkstemp(*args, **kwargs):
+        kwargs["dir"] = tmp_path
+        fd, path = real_mkstemp(*args, **kwargs)
+        created.append(Path(path))
+        return fd, path
+
+    def fail_runner(*args, **kwargs):
+        raise OSError("runner disappeared")
+
+    monkeypatch.setattr(delegate.tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(delegate.subprocess, "run", fail_runner)
+
+    with pytest.raises(OSError, match="runner disappeared"):
+        delegate.main(["Implement the endpoint"])
+
+    delegate_created = [path for path in created if path.name.startswith("delegate-")]
+    assert len(delegate_created) == 2
+    assert not any(path.exists() for path in delegate_created)
 
 
 def test_no_codex_capacity_overflows_automatically(isolated, monkeypatch, capsys):
