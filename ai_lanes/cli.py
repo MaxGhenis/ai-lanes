@@ -18,10 +18,12 @@ Orchestrator one-liners:
 
 import argparse
 import json
+import re
 import sys
+from pathlib import Path
 
-from . import claude, codex, config, paths, render, secret_store, snapshot, watchdog
-from .util import load_json, strip_private
+from . import capacity, claude, codex, config, paths, render, secret_store, snapshot, watchdog
+from .util import from_epoch, iso, load_json, now_local, parse_iso, parse_reset_clock, strip_private
 
 
 def _load_snapshot(cached: bool, live_timeout: float = 15.0) -> dict:
@@ -43,6 +45,110 @@ def cmd_status(args) -> int:
         if args.cached:
             print(f"\n(cached snapshot from {snap.get('generated_at')}; use without --cached for live)")
     return 0
+
+
+def _capacity_cell(reading: dict | None) -> str:
+    if not isinstance(reading, dict):
+        return "-"
+    used = reading.get("used_percent", reading.get("used"))
+    if reading.get("unit") == "percent" and used is not None:
+        return f"{float(used):.0f}%"
+    tokens = reading.get("tokens", reading.get("used"))
+    if tokens is None:
+        return "-"
+    capacity_tokens = reading.get("capacity")
+    if capacity_tokens:
+        pct = reading.get("used_percent")
+        suffix = f" ({float(pct):.0f}%)" if pct is not None else ""
+        return f"{int(tokens):,}/{int(capacity_tokens):,} tok{suffix}"
+    return f"{int(tokens):,} tok"
+
+
+def _learned_capacity_cell(value: dict | None) -> str:
+    if not isinstance(value, dict) or not any(v is not None for v in value.values()):
+        return "-"
+    five = value.get("five_hour")
+    week = value.get("weekly")
+    return "5h " + (f"{int(five):,}" if five is not None else "-") + \
+        " / 7d " + (f"{int(week):,}" if week is not None else "-")
+
+
+def cmd_capacity(args) -> int:
+    report = capacity.build()
+    if args.json:
+        print(json.dumps(strip_private(report), indent=1))
+        return 0
+
+    columns = ["family", "account", "five_hour", "weekly", "learned_capacity",
+               "limited_until", "confidence"]
+    rendered = []
+    for row in report.get("accounts") or []:
+        rendered.append(
+            [
+                str(row.get("family") or "-"),
+                str(row.get("email") or row.get("id") or row.get("resource") or "-"),
+                _capacity_cell(row.get("five_hour")),
+                _capacity_cell(row.get("weekly")),
+                _learned_capacity_cell(row.get("learned_capacity")),
+                str(row.get("limited_until") or "-"),
+                str(row.get("confidence") or "-"),
+            ]
+        )
+    widths = [len(name) for name in columns]
+    for row in rendered:
+        widths = [max(width, len(cell)) for width, cell in zip(widths, row)]
+
+    def line(row):
+        return "  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip()
+
+    print(line(columns))
+    print(line(["-" * width for width in widths]))
+    for row in rendered:
+        print(line(row))
+    return 0
+
+
+def _reset_from_text(text: str) -> str | None:
+    """Extract either an absolute reset value or a human reset clock."""
+    now = now_local()
+    for match in re.finditer(
+        r'(?i)(?:reset_at|resets_at|reset)["\s:=]+["\']?([^"\'\s,}]+)', text
+    ):
+        raw = match.group(1)
+        parsed = parse_iso(raw)
+        if parsed is None:
+            try:
+                parsed = from_epoch(float(raw))
+            except ValueError:
+                parsed = None
+        if parsed is not None:
+            return iso(parsed)
+    return iso(parse_reset_clock(text, now))
+
+
+def cmd_lane_usage(args) -> int:
+    """Internal, best-effort bridge used by claude-lane."""
+    try:
+        if args.action == "record":
+            capacity.append_lane_usage(
+                args.email,
+                Path(args.transcript),
+                session_id=args.session_id,
+            )
+            return 0
+        text = "\n".join(
+            Path(path).read_text(errors="replace")
+            for path in args.error_file
+            if Path(path).is_file()
+        )
+        event = capacity.record_hard_limit(args.email, reset=_reset_from_text(text))
+        if event.get("reset"):
+            print(event["reset"])
+        return 0
+    except Exception as exc:
+        # Accounting must never turn a completed agent run into a failure.
+        print(f"ai-lanes lane-usage: accounting skipped: {exc}", file=sys.stderr)
+        return 0
 
 
 def cmd_pick(args) -> int:
@@ -265,6 +371,9 @@ def main(argv=None) -> int:
     p_status.add_argument("--json", action="store_true")
     p_status.add_argument("--cached", action="store_true", help="use last watchdog snapshot (no network)")
 
+    p_capacity = sub.add_parser("capacity", help="5h + weekly headroom across both families")
+    p_capacity.add_argument("--json", action="store_true")
+
     p_pick = sub.add_parser("pick", help="best CODEX_HOME for dispatch")
     p_pick.add_argument("--json", action="store_true")
     p_pick.add_argument("--all", action="store_true", help="show full ranking")
@@ -301,19 +410,35 @@ def main(argv=None) -> int:
     p_secret.add_argument("action", choices=("get-for-account",))
     p_secret.add_argument("email")
 
+    p_usage = sub.add_parser("lane-usage", help=argparse.SUPPRESS)
+    usage_sub = p_usage.add_subparsers(dest="action", required=True)
+    p_usage_record = usage_sub.add_parser("record", help=argparse.SUPPRESS)
+    p_usage_record.add_argument("--email", required=True)
+    p_usage_record.add_argument("--session-id", required=True)
+    p_usage_record.add_argument("--transcript", required=True)
+    p_usage_limit = usage_sub.add_parser("hard-limit", help=argparse.SUPPRESS)
+    p_usage_limit.add_argument("--email", required=True)
+    p_usage_limit.add_argument("--session-id", required=True)
+    p_usage_limit.add_argument("--error-file", action="append", default=[])
+
     argv = list(sys.argv[1:] if argv is None else argv)
-    known = {"status", "pick", "claude-pick", "errors", "watch", "enroll", "secret"}
+    known = {
+        "status", "capacity", "pick", "claude-pick", "errors", "watch", "enroll",
+        "secret", "lane-usage",
+    }
     if not argv or (argv[0] not in known and argv[0] not in ("-h", "--help")):
         argv = ["status", *argv]
     args = parser.parse_args(argv)
     handlers = {
         "status": cmd_status,
+        "capacity": cmd_capacity,
         "pick": cmd_pick,
         "claude-pick": cmd_claude_pick,
         "errors": cmd_errors,
         "watch": cmd_watch,
         "enroll": cmd_enroll,
         "secret": cmd_secret,
+        "lane-usage": cmd_lane_usage,
     }
     return handlers[args.command](args)
 

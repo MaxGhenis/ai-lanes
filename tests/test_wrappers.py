@@ -7,10 +7,12 @@ not safe to infer from a successful subprocess alone.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,22 @@ def _write_executable(path: Path, source: str) -> Path:
     path.write_text(source)
     path.chmod(0o755)
     return path
+
+
+def _fake_ai_lanes_with_usage(fake_bin: Path) -> Path:
+    return _write_executable(
+        fake_bin / "ai-lanes",
+        """#!/usr/bin/env bash
+set -u
+if [ "$1" = secret ] && [ "$2" = get-for-account ]; then
+  [ "$3" = lane@example.com ] || exit 91
+  printf 'setup-token-example\n'
+  exit 0
+fi
+[ "$1" = lane-usage ] || exit 90
+exec "$WRAPPER_PYTHON" -m ai_lanes.cli "$@"
+""",
+    )
 
 
 def _run(*args: str | Path, cwd: Path | None = None, env: dict[str, str] | None = None):
@@ -223,14 +241,7 @@ def test_claude_lane_scrubs_api_keys_and_marks_transcript_model_mismatch(tmp_pat
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     env_capture = tmp_path / "claude.env"
-    fake_ai_lanes = _write_executable(
-        fake_bin / "ai-lanes",
-        """#!/usr/bin/env bash
-[ "$1" = secret ] && [ "$2" = get-for-account ] || exit 90
-[ "$3" = lane@example.com ] || exit 91
-printf 'setup-token-example\n'
-""",
-    )
+    fake_ai_lanes = _fake_ai_lanes_with_usage(fake_bin)
     fake_claude = _write_executable(
         fake_bin / "claude",
         """#!/usr/bin/env bash
@@ -252,8 +263,12 @@ printf '%s\n%s\n%s\n' \
 project_key=$(printf '%s' "$PWD" | tr '/.' '--')
 project_dir="$FAKE_CLAUDE_DIR/projects/$project_key"
 mkdir -p "$project_dir"
-printf '{"type":"assistant","message":{"model":"%s"}}\n' \
+printf '{"type":"assistant","message":{"id":"message-1","model":"%s","usage":{"input_tokens":3,"output_tokens":5}}}\n' \
   "$FAKE_SERVED_MODEL" >"$project_dir/$session.jsonl"
+printf '{"type":"assistant","message":{"id":"message-1","model":"%s","usage":{"input_tokens":7,"output_tokens":11}}}\n' \
+  "$FAKE_SERVED_MODEL" >>"$project_dir/$session.jsonl"
+printf '{"type":"assistant","message":{"id":"message-2","model":"%s","usage":{"input_tokens":13,"output_tokens":17}}}\n' \
+  "$FAKE_SERVED_MODEL" >>"$project_dir/$session.jsonl"
 printf '{"is_error":false,"result":"fake result"}\n'
 """,
     )
@@ -263,6 +278,7 @@ printf '{"is_error":false,"result":"fake result"}\n'
     prompt.write_text("Review the example")
     output = tmp_path / "answer.md"
     claude_dir = tmp_path / "claude-state"
+    state_dir = tmp_path / "ai-lanes-state"
     env = {
         **os.environ,
         "ANTHROPIC_API_KEY": "metered-api-value",
@@ -273,6 +289,9 @@ printf '{"is_error":false,"result":"fake result"}\n'
         "CLAUDE_LANE_CLAUDE_DIR": os.fspath(claude_dir),
         "FAKE_CLAUDE_DIR": os.fspath(claude_dir),
         "FAKE_SERVED_MODEL": "claude-opus-example",
+        "AI_LANES_STATE_DIR": os.fspath(state_dir),
+        "PYTHONPATH": os.fspath(ROOT),
+        "WRAPPER_PYTHON": sys.executable,
     }
 
     result = _run(
@@ -305,6 +324,86 @@ printf '{"is_error":false,"result":"fake result"}\n'
     assert "MODEL-DOWNGRADE" in marker.read_text()
     assert "latest: claude-opus-example" in marker.read_text()
     assert "MODEL-DOWNGRADE" in result.stderr
+    records = [
+        json.loads(line) for line in (state_dir / "lane-usage.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["email"] == "lane@example.com"
+    assert records[0]["session_id"]
+    assert records[0]["input_tokens"] == 20
+    assert records[0]["output_tokens"] == 28
+    assert records[0]["total_tokens"] == 48
+
+
+def test_claude_lane_records_hard_limit_before_returning_rc4(tmp_path):
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_ai_lanes = _fake_ai_lanes_with_usage(fake_bin)
+    fake_claude = _write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+set -u
+session=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --session-id ]; then
+    shift
+    session=$1
+  fi
+  shift
+done
+[ -n "$session" ] || exit 92
+project_key=$(printf '%s' "$PWD" | tr '/.' '--')
+project_dir="$FAKE_CLAUDE_DIR/projects/$project_key"
+mkdir -p "$project_dir"
+printf '%s\n' \
+  '{"type":"assistant","message":{"id":"limit-message","model":"claude-fable-5","usage":{"input_tokens":19,"output_tokens":23}}}' \
+  >"$project_dir/$session.jsonl"
+printf '%s\n' \
+  '{"is_error":true,"result":"You have hit your session limit; resets 6:40pm (America/New_York)"}'
+exit 1
+""",
+    )
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Review the example")
+    state_dir = tmp_path / "ai-lanes-state"
+    claude_dir = tmp_path / "claude-state"
+    env = {
+        **os.environ,
+        "AI_LANES_STATE_DIR": os.fspath(state_dir),
+        "CLAUDE_LANE_AI_LANES": os.fspath(fake_ai_lanes),
+        "CLAUDE_LANE_CLAUDE": os.fspath(fake_claude),
+        "CLAUDE_LANE_CLAUDE_DIR": os.fspath(claude_dir),
+        "FAKE_CLAUDE_DIR": os.fspath(claude_dir),
+        "PYTHONPATH": os.fspath(ROOT),
+        "WRAPPER_PYTHON": sys.executable,
+    }
+
+    result = _run(
+        "bash",
+        BIN / "claude-lane",
+        "-a",
+        "lane@example.com",
+        "-C",
+        workdir,
+        "-p",
+        prompt,
+        "-o",
+        tmp_path / "answer.md",
+        env=env,
+    )
+
+    assert result.returncode == 4, result.stderr
+    assert "claude-lane: hard limit reset=" in result.stderr
+    records = [
+        json.loads(line) for line in (state_dir / "lane-usage.jsonl").read_text().splitlines()
+    ]
+    assert len(records) == 2
+    assert records[0]["total_tokens"] == 42
+    assert records[1]["event"] == "hard_limit"
+    assert records[1]["email"] == "lane@example.com"
+    assert records[1]["reset"]
 
 
 def test_wrapper_sources_retain_hardening_primitives():

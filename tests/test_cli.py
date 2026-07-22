@@ -19,6 +19,53 @@ def test_help_exposes_generic_watch_without_removed_couplings(capsys):
     assert "launchd" not in help_text
 
 
+def test_capacity_json_has_one_normalized_row_per_account(monkeypatch, capsys):
+    report = {
+        "generated_at": "2026-07-22T12:00:00-04:00",
+        "cache": {"checked_at": "2026-07-22T12:00:00-04:00", "hit": True,
+                  "ttl_seconds": 120},
+        "accounts": [
+            {
+                "family": "claude",
+                "id": "lane@example.com",
+                "email": "lane@example.com",
+                "home": None,
+                "resource": "lane@example.com",
+                "five_hour": {"unit": "tokens", "tokens": 120, "used": 120,
+                              "capacity": None, "used_percent": None,
+                              "remaining_percent": None, "reset_at": None,
+                              "confidence": "estimated"},
+                "weekly": {"unit": "tokens", "tokens": 450, "used": 450,
+                           "capacity": None, "used_percent": None,
+                           "remaining_percent": None, "reset_at": None,
+                           "confidence": "estimated"},
+                "learned_capacity": None,
+                "limited_until": None,
+                "confidence": "estimated",
+                "dispatchable": True,
+                "status": "estimated",
+            }
+        ],
+        "families": {
+            "codex": {"score": 0, "best_resource": None, "earliest_reset": None,
+                      "dispatchable": 0},
+            "claude": {"score": 100, "best_resource": "lane@example.com",
+                       "earliest_reset": None, "dispatchable": 1},
+        },
+    }
+    monkeypatch.setattr(cli.capacity, "build", lambda: report)
+
+    assert cli.main(["capacity", "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+
+    assert output == report
+    row = output["accounts"][0]
+    assert {
+        "family", "id", "five_hour", "weekly", "learned_capacity",
+        "limited_until", "confidence",
+    } <= row.keys()
+
+
 def test_enroll_uses_configured_prefix_store_and_accounts_file(monkeypatch, capsys):
     config.save(
         {

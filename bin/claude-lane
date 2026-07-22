@@ -147,11 +147,33 @@ fetch_token() {
   fi
 }
 
-inline_model_report() {
-  local project_key project_dir transcript models latest refusals
+transcript_path() {
+  local project_key
   project_key=$( (cd "$WORKDIR" && printf '%s' "$PWD" | tr '/.' '--') )
-  project_dir="$CLAUDE_DIR/projects/$project_key"
-  transcript="$project_dir/$SID.jsonl"
+  printf '%s\n' "$CLAUDE_DIR/projects/$project_key/$SID.jsonl"
+}
+
+record_lane_usage() {
+  local transcript
+  transcript=$(transcript_path)
+  "$AI_LANES_BIN" lane-usage record --email "$EMAIL" --session-id "$SID" \
+    --transcript "$transcript" >/dev/null 2>&1 || true
+}
+
+record_hard_limit() {
+  local reset
+  local args=(lane-usage hard-limit --email "$EMAIL" --session-id "$SID" \
+    --error-file "$ERR_FILE")
+  [ -s "$RAW_FILE" ] && args+=(--error-file "$RAW_FILE")
+  reset=$("$AI_LANES_BIN" "${args[@]}" 2>/dev/null || true)
+  if [ -n "$reset" ]; then
+    echo "claude-lane: hard limit reset=$reset" >&2
+  fi
+}
+
+inline_model_report() {
+  local transcript models latest refusals
+  transcript=$(transcript_path)
   [ -f "$transcript" ] || {
     echo "no transcript at $transcript" >&2
     return 2
@@ -221,6 +243,7 @@ while :; do
       --session-id "$SID" --output-format json ${PERM_ARGS[@]+"${PERM_ARGS[@]}"}
   ) <"$PROMPT_FILE" >"$RAW_FILE" 2>"$ERR_FILE"
   rc=$?
+  record_lane_usage
 
   if [ $rc -eq 0 ] && [ -s "$RAW_FILE" ] && [ "$(jq -r \
       'if type=="object" and .is_error==false and (.result|type=="string" and length>0) then "ok" else "bad" end' \
@@ -244,6 +267,7 @@ while :; do
   fi
   if grep -qiE "usage limit|session limit|weekly limit|5-hour limit|limit reached|out of extra usage" \
       ${ERRTXT[@]+"${ERRTXT[@]}"}; then
+    record_hard_limit
     if [ "$AUTO" = 1 ] && [ $attempt -le $MAX_RETRIES ]; then
       OLD_EMAIL=$EMAIL
       echo "claude-lane: lane $OLD_EMAIL hit a hard limit; re-picking (attempt $attempt/$MAX_RETRIES)" >&2
